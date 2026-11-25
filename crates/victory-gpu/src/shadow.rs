@@ -15,8 +15,9 @@
 //! descriptors, buffer views in tables); buffers read through directly
 //! indexed heaps keep what their first use copied.
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -24,18 +25,64 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
-/// Per-page last copied write-watch sequence, tracking how many pages have
-/// never been copied whole (`uncopied == 0` enables the O(1)/O(|written|) fast
-/// path in [`Shadow::copy_stale`]).
+/// Inline-first buffer for coalesced dirty page runs produced by
+/// [`CopiedPages::plan_stale`]: avoids heap allocation for up to 8 runs per
+/// refresh (the overwhelming majority of refreshes).
+struct SmallRuns {
+    inline: [(usize, usize); 8],
+    inline_len: usize,
+    spill: Vec<(usize, usize)>,
+}
+
+impl SmallRuns {
+    fn new() -> Self {
+        Self {
+            inline: [(0, 0); 8],
+            inline_len: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, from: usize, to: usize) {
+        if self.inline_len < self.inline.len() {
+            self.inline[self.inline_len] = (from, to);
+            self.inline_len += 1;
+        } else {
+            self.spill.push((from, to));
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.inline[..self.inline_len]
+            .iter()
+            .copied()
+            .chain(self.spill.iter().copied())
+    }
+}
+
+/// Per-page last copied write-watch sequence, paired with a 64-page-per-word
+/// bitmask of uncopied pages so partially-initialized buffers and windows
+/// still hit the O(1)/O(|written|) fast path on initialized subranges and skip
+/// initialized regions 64 pages at a time when uncopied pages exist.
 struct CopiedPages {
     at: Vec<u64>,
+    /// Bit `i` (word `i / 64`, bit `i % 64`) is 1 iff `at[i] == 0`.
+    /// Unused high bits in the final word are always 0.
+    uncopied_bits: Vec<u64>,
     uncopied: usize,
 }
 
 impl CopiedPages {
     fn new(pages: usize) -> Self {
+        let words = pages.div_ceil(64);
+        let mut uncopied_bits = vec![u64::MAX; words];
+        let rem = pages % 64;
+        if rem != 0 {
+            uncopied_bits[words - 1] = (1u64 << rem) - 1;
+        }
         Self {
             at: vec![0; pages],
+            uncopied_bits,
             uncopied: pages,
         }
     }
@@ -48,15 +95,194 @@ impl CopiedPages {
         if let Some(slot) = self.at.get_mut(index) {
             if *slot == 0 && now != 0 {
                 self.uncopied -= 1;
+                self.uncopied_bits[index / 64] &= !(1u64 << (index % 64));
             } else if *slot != 0 && now == 0 {
                 self.uncopied += 1;
+                self.uncopied_bits[index / 64] |= 1u64 << (index % 64);
             }
             *slot = now;
         }
     }
 
+    #[cfg(test)]
     fn all_copied(&self) -> bool {
         self.uncopied == 0
+    }
+
+    /// Whether every page index in `lo..=hi` has been copied whole at least once.
+    fn range_all_copied(&self, lo: usize, hi: usize) -> bool {
+        if self.uncopied == 0 {
+            return true;
+        }
+        let first_w = lo / 64;
+        let last_w = hi / 64;
+        let lo_mask = u64::MAX << (lo % 64);
+        let hi_mask = u64::MAX >> (63 - (hi % 64));
+        if first_w == last_w {
+            return (self.uncopied_bits[first_w] & lo_mask & hi_mask) == 0;
+        }
+        if (self.uncopied_bits[first_w] & lo_mask) != 0 {
+            return false;
+        }
+        for &word in &self.uncopied_bits[first_w + 1..last_w] {
+            if word != 0 {
+                return false;
+            }
+        }
+        (self.uncopied_bits[last_w] & hi_mask) == 0
+    }
+
+    /// Lowest page index `>= from_idx` and `<= hi` that has never been copied whole.
+    fn next_uncopied(&self, from_idx: usize, hi: usize) -> Option<usize> {
+        if from_idx > hi || self.uncopied == 0 {
+            return None;
+        }
+        let mut w = from_idx / 64;
+        let last_w = hi / 64;
+        let mut word = self.uncopied_bits[w] & (u64::MAX << (from_idx % 64));
+        loop {
+            if w == last_w {
+                word &= u64::MAX >> (63 - (hi % 64));
+            }
+            if word != 0 {
+                return Some(w * 64 + word.trailing_zeros() as usize);
+            }
+            if w == last_w {
+                return None;
+            }
+            w += 1;
+            word = self.uncopied_bits[w];
+        }
+    }
+
+    /// Plans the coalesced byte ranges `[run_from, run_to)` inside `[from, to)`
+    /// that must be copied from title memory, updating whole-page copied
+    /// timestamps to `now`. Runs purely on metadata so callers can release the
+    /// `copied` mutex before invoking memory copies.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_stale(
+        &mut self,
+        base: usize,
+        start: usize,
+        end: usize,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+    ) -> SmallRuns {
+        let mut runs = SmallRuns::new();
+        if from >= to {
+            return runs;
+        }
+        let first_page = from / PAGE;
+        let last = (to - 1) / PAGE;
+        let lo = first_page - base;
+        let hi = last - base;
+
+        let push_page = |runs: &mut SmallRuns, run: &mut Option<(usize, usize)>, page: usize| {
+            match *run {
+                Some((_, run_end)) if page < run_end => {}
+                Some((run_start, run_end)) if page == run_end => {
+                    *run = Some((run_start, page + 1));
+                }
+                Some((run_start, run_end)) => {
+                    runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+                    *run = Some((page, page + 1));
+                }
+                None => *run = Some((page, page + 1)),
+            }
+        };
+
+        let mut run: Option<(usize, usize)> = None;
+        let w_start = if written.len() > 8 {
+            written.partition_point(|&(p, _)| p < first_page)
+        } else {
+            0
+        };
+
+        // Fast path: every page in `[from, to)` has been initialized at least
+        // once (even if other pages of the same buffer/window have not).
+        if self.range_all_copied(lo, hi) {
+            if written.is_empty() {
+                return runs;
+            }
+            for &(page, write) in &written[w_start..] {
+                if page < first_page {
+                    continue;
+                }
+                if page > last {
+                    break;
+                }
+                let idx = page - base;
+                if write <= self.at[idx] {
+                    continue;
+                }
+                // A page only partly in the range is copied in part: it stays
+                // stale for the rest.
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    self.set(idx, now);
+                }
+                push_page(&mut runs, &mut run, page);
+            }
+            if let Some((run_start, run_end)) = run {
+                runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+            }
+            return runs;
+        }
+
+        // Sparse merge of uncopied pages (via 64-page bitmask) and dirty
+        // `written` entries in `[first_page, last]`, skipping already-clean
+        // initialized spans without touching `self.at`.
+        let mut wi = w_start;
+        while wi < written.len() && written[wi].0 < first_page {
+            wi += 1;
+        }
+        let mut next_u = self.next_uncopied(lo, hi);
+        loop {
+            while wi < written.len() && written[wi].0 <= last {
+                let (wp, write) = written[wi];
+                let idx = wp - base;
+                if self.at[idx] == 0 || write > self.at[idx] {
+                    break;
+                }
+                wi += 1;
+            }
+            let next_w = (wi < written.len() && written[wi].0 <= last).then(|| written[wi].0 - base);
+            let idx = match (next_u, next_w) {
+                (Some(u), Some(w)) if u < w => {
+                    next_u = self.next_uncopied(u + 1, hi);
+                    u
+                }
+                (Some(u), Some(w)) if w < u => {
+                    wi += 1;
+                    w
+                }
+                (Some(u), Some(_)) => {
+                    next_u = self.next_uncopied(u + 1, hi);
+                    wi += 1;
+                    u
+                }
+                (Some(u), None) => {
+                    next_u = self.next_uncopied(u + 1, hi);
+                    u
+                }
+                (None, Some(w)) => {
+                    wi += 1;
+                    w
+                }
+                (None, None) => break,
+            };
+            let page = base + idx;
+            if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                self.set(idx, now);
+            }
+            push_page(&mut runs, &mut run, page);
+        }
+        // Cut to the range: next to it shaders may be writing the copy.
+        if let Some((run_start, run_end)) = run {
+            runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+        }
+        runs
     }
 
     #[cfg(any(test, feature = "diagnostics"))]
@@ -81,6 +307,9 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Lock-free mirror of `!pending.is_empty()` so read-only windows and
+    /// buffers skip acquiring `pending` on every refresh and flight check.
+    has_pending: AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -137,11 +366,18 @@ struct Card {
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
     dirty: Mutex<Vec<(usize, usize)>>,
+    /// Lock-free mirror of `!dirty.is_empty()`; cleared only after `sent` and
+    /// `has_sent` have been updated so concurrent `card_merge_relay` readers
+    /// observing `has_dirty == false` are guaranteed to observe `has_sent == true`.
+    has_dirty: AtomicBool,
     /// With [`relay`]: the offsets that went from `dirty` to the card's
     /// side, each with the number of the send that took it
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// Lock-free mirror of `!sent.is_empty()` so clean carded copies skip
+    /// locking `sent` on every submission.
+    has_sent: AtomicBool,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -360,24 +596,40 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    let relay_on = relay();
     carded.retain(|weak| {
         let Some(shadow) = weak.upgrade() else {
             return false;
         };
-        let ranges = shadow
-            .card
-            .as_ref()
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = std::mem::take(&mut *dirty);
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.retain(|s| s.2 > fetched);
-                    sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
-                }
-                ranges
-            })
-            .unwrap_or_default();
+        let Some(c) = shadow.card.as_ref() else {
+            return true;
+        };
+        let has_dirty = c.has_dirty.load(Ordering::Acquire);
+        let has_sent = relay_on && c.has_sent.load(Ordering::Acquire);
+        if !has_dirty && !has_sent {
+            return true;
+        }
+        let ranges = if has_dirty {
+            let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let ranges = std::mem::take(&mut *dirty);
+            if relay_on {
+                let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+                sent.retain(|s| s.2 > fetched);
+                sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+                // Publish `has_sent` BEFORE clearing `has_dirty` so a concurrent
+                // `card_merge_relay` checking `has_dirty` then `has_sent` never
+                // observes both false while a range is transitioning.
+                c.has_sent.store(!sent.is_empty(), Ordering::Release);
+            }
+            c.has_dirty.store(false, Ordering::Release);
+            ranges
+        } else {
+            // Only pruning stale `sent` entries (respects `dirty` -> `sent` lock order).
+            let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+            sent.retain(|s| s.2 > fetched);
+            c.has_sent.store(!sent.is_empty(), Ordering::Release);
+            Vec::new()
+        };
         if !ranges.is_empty() {
             out.push((shadow, joined(ranges)));
         }
@@ -624,6 +876,174 @@ impl Flights {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_avx2() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+}
+
+/// Copies `len` bytes from write-combined (USWC) memory (`src`, e.g. a ReBAR
+/// `D3D12_HEAP_TYPE_GPU_UPLOAD` mapping) into cached system memory (`dst`).
+/// Uses AVX2 `VMOVNTDQA` streaming loads on 32-byte aligned addresses to read
+/// full PCIe cache-line bursts instead of uncached scalar reads.
+///
+/// # Safety
+/// `src` must be valid for reads of `len` bytes, `dst` valid for writes of
+/// `len` bytes, and the two ranges must not overlap.
+unsafe fn copy_from_wc(src: *const u8, dst: *mut u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if len >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; pointer bounds guaranteed by caller.
+        unsafe { copy_from_wc_avx2(src, dst, len) };
+        return;
+    }
+    // SAFETY: caller's bounds and non-overlap guarantee.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_from_wc_avx2(src: *const u8, dst: *mut u8, len: usize) {
+    use std::arch::x86_64::{__m256i, _mm256_storeu_si256, _mm256_stream_load_si256};
+    let prefix = src.align_offset(32).min(len);
+    if prefix > 0 {
+        // SAFETY: `prefix <= len`.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, prefix) };
+    }
+    let mut at = prefix;
+    // Issue 8 aligned VMOVNTDQA streaming loads (256 bytes = 4 cache lines)
+    // back-to-back before storing so the CPU's fill buffers overlap multiple
+    // PCIe read bursts simultaneously.
+    while at + 256 <= len {
+        // SAFETY: `src.add(at)` is 32-byte aligned and `at + 256 <= len`.
+        unsafe {
+            let s = src.add(at);
+            let d = dst.add(at);
+            let v0 = _mm256_stream_load_si256(s.cast::<__m256i>());
+            let v1 = _mm256_stream_load_si256(s.add(32).cast::<__m256i>());
+            let v2 = _mm256_stream_load_si256(s.add(64).cast::<__m256i>());
+            let v3 = _mm256_stream_load_si256(s.add(96).cast::<__m256i>());
+            let v4 = _mm256_stream_load_si256(s.add(128).cast::<__m256i>());
+            let v5 = _mm256_stream_load_si256(s.add(160).cast::<__m256i>());
+            let v6 = _mm256_stream_load_si256(s.add(192).cast::<__m256i>());
+            let v7 = _mm256_stream_load_si256(s.add(224).cast::<__m256i>());
+            _mm256_storeu_si256(d.cast::<__m256i>(), v0);
+            _mm256_storeu_si256(d.add(32).cast::<__m256i>(), v1);
+            _mm256_storeu_si256(d.add(64).cast::<__m256i>(), v2);
+            _mm256_storeu_si256(d.add(96).cast::<__m256i>(), v3);
+            _mm256_storeu_si256(d.add(128).cast::<__m256i>(), v4);
+            _mm256_storeu_si256(d.add(160).cast::<__m256i>(), v5);
+            _mm256_storeu_si256(d.add(192).cast::<__m256i>(), v6);
+            _mm256_storeu_si256(d.add(224).cast::<__m256i>(), v7);
+        }
+        at += 256;
+    }
+    while at + 32 <= len {
+        // SAFETY: `src.add(at)` is 32-byte aligned and `at + 32 <= len`.
+        unsafe {
+            let v = _mm256_stream_load_si256(src.add(at).cast::<__m256i>());
+            _mm256_storeu_si256(dst.add(at).cast::<__m256i>(), v);
+        }
+        at += 32;
+    }
+    if at < len {
+        // SAFETY: remaining tail within `len`.
+        unsafe { std::ptr::copy_nonoverlapping(src.add(at), dst.add(at), len - at) };
+    }
+}
+
+/// Compares `len` bytes of write-combined memory (`wc_src`) against cached
+/// memory (`cached`) using AVX2 `VMOVNTDQA` streaming loads on aligned
+/// addresses, avoiding uncached PCIe scalar loads and scratch allocations.
+///
+/// # Safety
+/// Both `wc_src` and `cached` must be valid for reads of `len` bytes.
+unsafe fn slices_equal_wc(wc_src: *const u8, cached: *const u8, len: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if len >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; pointer bounds guaranteed by caller.
+        return unsafe { slices_equal_wc_avx2(wc_src, cached, len) };
+    }
+    // SAFETY: caller's bounds guarantee.
+    unsafe {
+        std::slice::from_raw_parts(wc_src, len) == std::slice::from_raw_parts(cached, len)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn slices_equal_wc_avx2(wc_src: *const u8, cached: *const u8, len: usize) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+        _mm256_set1_epi8, _mm256_stream_load_si256,
+    };
+    let prefix = wc_src.align_offset(32).min(len);
+    for i in 0..prefix {
+        // SAFETY: `i < prefix <= len`.
+        if unsafe { *wc_src.add(i) != *cached.add(i) } {
+            return false;
+        }
+    }
+    let mut at = prefix;
+    // Branch ONLY once per 4 KiB block (16 x 256-byte chunks) so the CPU does
+    // not serialize USWC streaming loads behind a per-cache-line branch.
+    const BLOCK: usize = 4096;
+    while at + 256 <= len {
+        let block_end = (at + BLOCK).min(len - (len - at) % 256);
+        let mut acc0 = _mm256_set1_epi8(-1);
+        let mut acc1 = _mm256_set1_epi8(-1);
+        while at < block_end {
+            // SAFETY: `wc_src.add(at)` is 32-byte aligned and `at + 256 <= len`.
+            unsafe {
+                let w = wc_src.add(at);
+                let c = cached.add(at);
+                let w0 = _mm256_stream_load_si256(w.cast::<__m256i>());
+                let w1 = _mm256_stream_load_si256(w.add(32).cast::<__m256i>());
+                let w2 = _mm256_stream_load_si256(w.add(64).cast::<__m256i>());
+                let w3 = _mm256_stream_load_si256(w.add(96).cast::<__m256i>());
+                let w4 = _mm256_stream_load_si256(w.add(128).cast::<__m256i>());
+                let w5 = _mm256_stream_load_si256(w.add(160).cast::<__m256i>());
+                let w6 = _mm256_stream_load_si256(w.add(192).cast::<__m256i>());
+                let w7 = _mm256_stream_load_si256(w.add(224).cast::<__m256i>());
+                let e0 = _mm256_cmpeq_epi8(w0, _mm256_loadu_si256(c.cast::<__m256i>()));
+                let e1 = _mm256_cmpeq_epi8(w1, _mm256_loadu_si256(c.add(32).cast::<__m256i>()));
+                let e2 = _mm256_cmpeq_epi8(w2, _mm256_loadu_si256(c.add(64).cast::<__m256i>()));
+                let e3 = _mm256_cmpeq_epi8(w3, _mm256_loadu_si256(c.add(96).cast::<__m256i>()));
+                let e4 = _mm256_cmpeq_epi8(w4, _mm256_loadu_si256(c.add(128).cast::<__m256i>()));
+                let e5 = _mm256_cmpeq_epi8(w5, _mm256_loadu_si256(c.add(160).cast::<__m256i>()));
+                let e6 = _mm256_cmpeq_epi8(w6, _mm256_loadu_si256(c.add(192).cast::<__m256i>()));
+                let e7 = _mm256_cmpeq_epi8(w7, _mm256_loadu_si256(c.add(224).cast::<__m256i>()));
+                acc0 = _mm256_and_si256(acc0, _mm256_and_si256(_mm256_and_si256(e0, e1), _mm256_and_si256(e2, e3)));
+                acc1 = _mm256_and_si256(acc1, _mm256_and_si256(_mm256_and_si256(e4, e5), _mm256_and_si256(e6, e7)));
+            }
+            at += 256;
+        }
+        if _mm256_movemask_epi8(_mm256_and_si256(acc0, acc1)) != -1i32 {
+            return false;
+        }
+    }
+    while at + 32 <= len {
+        // SAFETY: `wc_src.add(at)` is 32-byte aligned and `at + 32 <= len`.
+        let eq = unsafe {
+            let w = _mm256_stream_load_si256(wc_src.add(at).cast::<__m256i>());
+            let c = _mm256_loadu_si256(cached.add(at).cast::<__m256i>());
+            _mm256_cmpeq_epi8(w, c)
+        };
+        if _mm256_movemask_epi8(eq) != -1i32 {
+            return false;
+        }
+        at += 32;
+    }
+    for i in at..len {
+        // SAFETY: `i < len`.
+        if unsafe { *wc_src.add(i) != *cached.add(i) } {
+            return false;
+        }
+    }
+    true
+}
+
 /// The relay's merge of a stretch of a copy ([`relay`]). `now` is what the
 /// card's memory holds, read once; `held` is the copy's reference for the
 /// stretch (its snapshot, or the CPU's side of a copy in the card's
@@ -638,15 +1058,248 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let n = now.len().min(held.len()).min(title.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= n`.
+        return unsafe { merge_piece_avx2(&now[..n], &mut held[..n], &mut title[..n]) };
+    }
+    merge_piece_scalar(&now[..n], &mut held[..n], &mut title[..n])
+}
+
+fn merge_piece_scalar(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    for ((&n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+        if n != *h {
+            differs |= n ^ *t;
+            *t = n;
+            *h = n;
+        }
     }
     differs != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_piece_avx2(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_blendv_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+        _mm256_or_si256, _mm256_setzero_si256, _mm256_storeu_si256, _mm256_testz_si256,
+        _mm256_xor_si256,
+    };
+    let n = now.len();
+    let (np, hp, tp) = (now.as_ptr(), held.as_mut_ptr(), title.as_mut_ptr());
+    let mut vdiff = _mm256_setzero_si256();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` within all three slices.
+        unsafe {
+            let vn = _mm256_loadu_si256(np.add(i).cast::<__m256i>());
+            let vh = _mm256_loadu_si256(hp.add(i).cast::<__m256i>());
+            let eq = _mm256_cmpeq_epi8(vn, vh);
+            if _mm256_movemask_epi8(eq) != -1i32 {
+                let vt = _mm256_loadu_si256(tp.add(i).cast::<__m256i>());
+                let merged = _mm256_blendv_epi8(vn, vt, eq);
+                vdiff = _mm256_or_si256(vdiff, _mm256_xor_si256(merged, vt));
+                _mm256_storeu_si256(tp.add(i).cast::<__m256i>(), merged);
+                _mm256_storeu_si256(hp.add(i).cast::<__m256i>(), vn);
+            }
+        }
+        i += 32;
+    }
+    let differs = _mm256_testz_si256(vdiff, vdiff) == 0;
+    merge_piece_scalar(&now[i..], &mut held[i..], &mut title[i..]) || differs
+}
+
+/// Synchronous copy-back merge for [`Shadow::copy_back_with`]: for each byte,
+/// takes `host` where `host != old` (GPU wrote), else `title` (keeping title
+/// CPU writes); writes the merged bytes into both `title` and `host` while
+/// skipping stores to unchanged 32-byte vectors so clean GPU-shared cache lines
+/// are not dirtied. Returns whether `title` changed.
+fn merge_sync_host(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    let n = title.len().min(host.len()).min(old.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= n`.
+        return unsafe { merge_sync_host_avx2(&mut title[..n], &mut host[..n], &old[..n]) };
+    }
+    merge_sync_host_scalar(&mut title[..n], &mut host[..n], &old[..n])
+}
+
+fn merge_sync_host_scalar(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    let mut differs = 0u8;
+    for ((t, h), &o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+        if *h != o {
+            differs |= *h ^ *t;
+            *t = *h;
+        } else if *h != *t {
+            *h = *t;
+        }
+    }
+    differs != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_sync_host_avx2(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_blendv_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_or_si256, _mm256_setzero_si256, _mm256_storeu_si256,
+        _mm256_testz_si256, _mm256_xor_si256,
+    };
+    let n = title.len();
+    let (tp, hp, op) = (title.as_mut_ptr(), host.as_mut_ptr(), old.as_ptr());
+    let mut vdiff = _mm256_setzero_si256();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` within all three slices.
+        unsafe {
+            let vt = _mm256_loadu_si256(tp.add(i).cast::<__m256i>());
+            let vh = _mm256_loadu_si256(hp.add(i).cast::<__m256i>());
+            let vo = _mm256_loadu_si256(op.add(i).cast::<__m256i>());
+            let eq_ho = _mm256_cmpeq_epi8(vh, vo);
+            let eq_th = _mm256_cmpeq_epi8(vt, vh);
+            if _mm256_movemask_epi8(_mm256_and_si256(eq_ho, eq_th)) != -1i32 {
+                let merged = _mm256_blendv_epi8(vh, vt, eq_ho);
+                let diff_t = _mm256_xor_si256(merged, vt);
+                if _mm256_testz_si256(diff_t, diff_t) == 0 {
+                    vdiff = _mm256_or_si256(vdiff, diff_t);
+                    _mm256_storeu_si256(tp.add(i).cast::<__m256i>(), merged);
+                }
+                if _mm256_movemask_epi8(_mm256_cmpeq_epi8(merged, vh)) != -1i32 {
+                    _mm256_storeu_si256(hp.add(i).cast::<__m256i>(), merged);
+                }
+            }
+        }
+        i += 32;
+    }
+    let differs = _mm256_testz_si256(vdiff, vdiff) == 0;
+    merge_sync_host_scalar(&mut title[i..], &mut host[i..], &old[i..]) || differs
+}
+
+/// Synchronous card-buffer copy-back merge for [`Shadow::card_merge`]: takes
+/// `gpu` where `gpu != old`, else `title`, writing merged bytes into both
+/// `title` and `old` without dirtying unchanged 32-byte vectors. Returns
+/// whether `title` changed.
+fn merge_sync_card(title: &mut [u8], gpu: &[u8], old: &mut [u8]) -> bool {
+    let n = title.len().min(gpu.len()).min(old.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= n`.
+        return unsafe { merge_sync_card_avx2(&mut title[..n], &gpu[..n], &mut old[..n]) };
+    }
+    merge_sync_card_scalar(&mut title[..n], &gpu[..n], &mut old[..n])
+}
+
+fn merge_sync_card_scalar(title: &mut [u8], gpu: &[u8], old: &mut [u8]) -> bool {
+    let mut differs = 0u8;
+    for ((t, &g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
+        if g != *o {
+            differs |= g ^ *t;
+            *t = g;
+            *o = g;
+        } else if *o != *t {
+            *o = *t;
+        }
+    }
+    differs != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_sync_card_avx2(title: &mut [u8], gpu: &[u8], old: &mut [u8]) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_blendv_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_or_si256, _mm256_setzero_si256, _mm256_storeu_si256,
+        _mm256_testz_si256, _mm256_xor_si256,
+    };
+    let n = title.len();
+    let (tp, gp, op) = (title.as_mut_ptr(), gpu.as_ptr(), old.as_mut_ptr());
+    let mut vdiff = _mm256_setzero_si256();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` within all three slices.
+        unsafe {
+            let vt = _mm256_loadu_si256(tp.add(i).cast::<__m256i>());
+            let vg = _mm256_loadu_si256(gp.add(i).cast::<__m256i>());
+            let vo = _mm256_loadu_si256(op.add(i).cast::<__m256i>());
+            let eq_go = _mm256_cmpeq_epi8(vg, vo);
+            let eq_to = _mm256_cmpeq_epi8(vt, vo);
+            if _mm256_movemask_epi8(_mm256_and_si256(eq_go, eq_to)) != -1i32 {
+                let merged = _mm256_blendv_epi8(vg, vt, eq_go);
+                let diff_t = _mm256_xor_si256(merged, vt);
+                if _mm256_testz_si256(diff_t, diff_t) == 0 {
+                    vdiff = _mm256_or_si256(vdiff, diff_t);
+                    _mm256_storeu_si256(tp.add(i).cast::<__m256i>(), merged);
+                }
+                if _mm256_movemask_epi8(_mm256_cmpeq_epi8(merged, vo)) != -1i32 {
+                    _mm256_storeu_si256(op.add(i).cast::<__m256i>(), merged);
+                }
+            }
+        }
+        i += 32;
+    }
+    let differs = _mm256_testz_si256(vdiff, vdiff) == 0;
+    merge_sync_card_scalar(&mut title[i..], &gpu[i..], &mut old[i..]) || differs
+}
+
+/// Merges GPU-written bytes (`gpu != old`) into `title` without modifying `gpu`
+/// or `old`. Used by the WC ReBAR path of [`Shadow::copy_back_with`] so `gpu`
+/// stays intact as the baseline for [`changed_runs`]. Returns whether `title`
+/// changed.
+fn merge_gpu_into_title(title: &mut [u8], gpu: &[u8], old: &[u8]) -> bool {
+    let n = title.len().min(gpu.len()).min(old.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= n`.
+        return unsafe { merge_gpu_into_title_avx2(&mut title[..n], &gpu[..n], &old[..n]) };
+    }
+    merge_gpu_into_title_scalar(&mut title[..n], &gpu[..n], &old[..n])
+}
+
+fn merge_gpu_into_title_scalar(title: &mut [u8], gpu: &[u8], old: &[u8]) -> bool {
+    let mut differs = 0u8;
+    for ((t, &g), &o) in title.iter_mut().zip(gpu).zip(old) {
+        if g != o {
+            differs |= g ^ *t;
+            *t = g;
+        }
+    }
+    differs != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_gpu_into_title_avx2(title: &mut [u8], gpu: &[u8], old: &[u8]) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_blendv_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+        _mm256_or_si256, _mm256_setzero_si256, _mm256_storeu_si256, _mm256_testz_si256,
+        _mm256_xor_si256,
+    };
+    let n = title.len();
+    let (tp, gp, op) = (title.as_mut_ptr(), gpu.as_ptr(), old.as_ptr());
+    let mut vdiff = _mm256_setzero_si256();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` within all three slices.
+        unsafe {
+            let vg = _mm256_loadu_si256(gp.add(i).cast::<__m256i>());
+            let vo = _mm256_loadu_si256(op.add(i).cast::<__m256i>());
+            let eq = _mm256_cmpeq_epi8(vg, vo);
+            if _mm256_movemask_epi8(eq) != -1i32 {
+                let vt = _mm256_loadu_si256(tp.add(i).cast::<__m256i>());
+                let merged = _mm256_blendv_epi8(vg, vt, eq);
+                let diff_t = _mm256_xor_si256(merged, vt);
+                if _mm256_testz_si256(diff_t, diff_t) == 0 {
+                    vdiff = _mm256_or_si256(vdiff, diff_t);
+                    _mm256_storeu_si256(tp.add(i).cast::<__m256i>(), merged);
+                }
+            }
+        }
+        i += 32;
+    }
+    let differs = _mm256_testz_si256(vdiff, vdiff) == 0;
+    merge_gpu_into_title_scalar(&mut title[i..], &gpu[i..], &old[i..]) || differs
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -934,26 +1587,77 @@ const NOT_WATCHED: u8 = 2;
 /// failing `GetWriteWatch` kernel syscall on every refresh).
 const VIEW_GUARDED: u8 = 3;
 
-/// Where `a` and `b` (of one length) first differ, compared eight bytes at
-/// a time.
+/// Where `a` and `b` (of one length) first differ (AVX2 32 bytes at a time,
+/// falling back to 8 bytes at a time).
 fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    let n = a.len().min(b.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= n`.
+        return unsafe { first_difference_avx2(&a[..n], &b[..n]) };
+    }
+    first_difference_scalar(&a[..n], &b[..n])
+}
+
+fn first_difference_scalar(a: &[u8], b: &[u8]) -> Option<usize> {
     let whole = a.len().min(b.len()) / 8 * 8;
     let from = a[..whole]
-        .as_chunks::<8>().0.iter()
+        .as_chunks::<8>()
+        .0
+        .iter()
         .zip(b[..whole].chunks_exact(8))
         .position(|(x, y)| x != y)
         .map_or(whole, |word| word * 8);
-    a[from..].iter().zip(&b[from..]).position(|(x, y)| x != y).map(|i| from + i)
+    a[from..]
+        .iter()
+        .zip(&b[from..])
+        .position(|(x, y)| x != y)
+        .map(|i| from + i)
 }
 
-/// Where `a` and `b` (of one length) last differ.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn first_difference_avx2(a: &[u8], b: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let n = a.len();
+    let (ap, bp) = (a.as_ptr(), b.as_ptr());
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` within both slices.
+        let mask = unsafe {
+            let va = _mm256_loadu_si256(ap.add(i).cast::<__m256i>());
+            let vb = _mm256_loadu_si256(bp.add(i).cast::<__m256i>());
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb)) as u32
+        };
+        if mask != u32::MAX {
+            return Some(i + (!mask).trailing_zeros() as usize);
+        }
+        i += 32;
+    }
+    first_difference_scalar(&a[i..], &b[i..]).map(|off| i + off)
+}
+
+/// Where `a` and `b` (of one length) last differ (AVX2 32 bytes at a time,
+/// falling back to 8 bytes at a time).
 fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    let n = a.len().min(b.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= n`.
+        return unsafe { last_difference_avx2(&a[..n], &b[..n]) };
+    }
+    last_difference_scalar(&a[..n], &b[..n])
+}
+
+fn last_difference_scalar(a: &[u8], b: &[u8]) -> Option<usize> {
     let whole = a.len().min(b.len()) / 8 * 8;
     if let Some(i) = a[whole..].iter().zip(&b[whole..]).rposition(|(x, y)| x != y) {
         return Some(whole + i);
     }
     let word = a[..whole]
-        .as_chunks::<8>().0.iter()
+        .as_chunks::<8>()
+        .0
+        .iter()
         .zip(b[..whole].chunks_exact(8))
         .rposition(|(x, y)| x != y)?
         * 8;
@@ -962,6 +1666,32 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         .zip(&b[word..word + 8])
         .rposition(|(x, y)| x != y)
         .map(|i| word + i)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn last_difference_avx2(a: &[u8], b: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let n = a.len();
+    let whole = n & !31;
+    if let Some(i) = a[whole..].iter().zip(&b[whole..]).rposition(|(x, y)| x != y) {
+        return Some(whole + i);
+    }
+    let (ap, bp) = (a.as_ptr(), b.as_ptr());
+    let mut i = whole;
+    while i >= 32 {
+        i -= 32;
+        // SAFETY: `i + 32 <= whole <= n` within both slices.
+        let mask = unsafe {
+            let va = _mm256_loadu_si256(ap.add(i).cast::<__m256i>());
+            let vb = _mm256_loadu_si256(bp.add(i).cast::<__m256i>());
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb)) as u32
+        };
+        if mask != u32::MAX {
+            return Some(i + 31 - (!mask).leading_zeros() as usize);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -994,31 +1724,42 @@ mod difference_tests {
 /// The unit shader writes are looked for and put back in.
 const PIECE: usize = 64 << 10;
 
-/// Copies `len` bytes, on several threads if they are many: a snapshot of
-/// the world's big heap is 100-170 MB per submission, 2-4 GB a frame, and
-/// one thread copies some 8 GB/s.
+/// Copies `len` bytes, on the kept worker pool ([`wide`]) if they are many:
+/// a snapshot of the world's big heap is 100-170 MB per submission, 2-4 GB a
+/// frame, and one thread copies some 8 GB/s. When `src_wc` is true (`src` is
+/// write-combined ReBAR memory), uses AVX2 `VMOVNTDQA` streaming loads.
 ///
 /// # Safety
 /// Both ranges are valid for `len` bytes and do not overlap.
-unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
+unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize, src_wc: bool) {
+    // Keep WC PCIe BAR reads single-threaded: concurrent multi-core reads to
+    // distinct BAR offsets thrash the PCIe read queue and drop bandwidth ~10x.
+    if src_wc {
+        // SAFETY: caller's bounds and non-overlap guarantee.
+        unsafe { copy_from_wc(src, dst, len) };
+        return;
+    }
     const PER_THREAD: usize = 16 << 20;
     let threads = (len / PER_THREAD).clamp(1, 6);
     if threads == 1 {
-        // SAFETY: the caller's.
+        // SAFETY: caller's bounds and non-overlap guarantee.
         unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
         return;
     }
     let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
-    std::thread::scope(|s| {
-        for i in 0..threads {
-            let at = (i * each).min(len);
-            let n = each.min(len - at);
-            s.spawn(move || {
-                // SAFETY: a part of the caller's ranges.
-                unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
-            });
+    let mut jobs: Vec<Job> = Vec::with_capacity(threads);
+    for i in 0..threads {
+        let at = (i * each).min(len);
+        let n = each.min(len - at);
+        if n == 0 {
+            continue;
         }
-    });
+        jobs.push(Box::new(move || {
+            // SAFETY: disjoint sub-ranges within the caller's valid ranges.
+            unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
+        }));
+    }
+    wide(jobs);
 }
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
@@ -1050,36 +1791,117 @@ pub(crate) fn wide_back() -> bool {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// Lock-free completion state for one [`wide`] batch: workers decrement `left`
+/// atomically and only lock `lock` to notify `ready` on the final job (`1 -> 0`).
+/// Any panic in a worker job is captured so the worker thread stays alive, the
+/// batch finishes without deadlocking, and the caller re-throws the panic.
+struct WideDone {
+    left: AtomicUsize,
+    lock: Mutex<()>,
+    ready: std::sync::Condvar,
+    panic: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+}
+
+impl WideDone {
+    fn finish_one(&self) {
+        if self.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.ready.notify_all();
+        }
+    }
+
+    fn run_job(&self, job: Job) {
+        struct FinishGuard<'a>(&'a WideDone);
+        impl Drop for FinishGuard<'_> {
+            fn drop(&mut self) {
+                self.0.finish_one();
+            }
+        }
+        let _finish = FinishGuard(self);
+        let _in_wide = InWideGuard::enter();
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+            let mut slot = self.panic.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some(payload);
+            }
+        }
+    }
+
+    fn wait_and_rethrow(&self) {
+        if self.left.load(Ordering::Acquire) > 0 {
+            let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            while self.left.load(Ordering::Acquire) > 0 {
+                guard = self.ready.wait(guard).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        if let Some(payload) = self.panic.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+thread_local! {
+    /// Prevents nested [`wide`] calls (e.g. from inside a worker job) from
+    /// starving the pool; nested calls execute inline instead.
+    static IN_WIDE: Cell<bool> = const { Cell::new(false) };
+    /// Reusable 64 KiB scratch buffer for [`Shadow::copy_back_with`] and
+    /// [`Shadow::merge_under_writes`], avoiding per-call heap allocation and
+    /// zero-initialization.
+    static SCRATCH_TITLE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// Reusable 64 KiB scratch buffer for copying WC ReBAR pieces into cached
+    /// RAM once before diffing and merging in [`Shadow::copy_back_with`].
+    static SCRATCH_WC: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+struct InWideGuard(bool);
+
+impl InWideGuard {
+    fn enter() -> Self {
+        let prev = IN_WIDE.with(|c| c.replace(true));
+        Self(prev)
+    }
+}
+
+impl Drop for InWideGuard {
+    fn drop(&mut self) {
+        IN_WIDE.with(|c| c.set(self.0));
+    }
+}
+
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
 struct Workers {
-    jobs: Mutex<std::collections::VecDeque<Job>>,
+    jobs: Mutex<std::collections::VecDeque<(Job, Arc<WideDone>)>>,
     more: std::sync::Condvar,
+    threads: usize,
 }
 
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
+    let n = std::thread::available_parallelism()
+        .map_or(4, |n| n.get() / 4)
+        .clamp(2, 6);
     let workers = WORKERS.get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
         more: std::sync::Condvar::new(),
+        threads: n,
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
-        for i in 0..n {
+        for i in 0..workers.threads {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
                 loop {
-                    let job = {
+                    let (job, done) = {
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
-                            if let Some(job) = jobs.pop_front() {
-                                break job;
+                            if let Some(item) = jobs.pop_front() {
+                                break item;
                             }
                             jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
                         }
                     };
-                    job();
+                    done.run_job(job);
                 }
             });
         }
@@ -1088,42 +1910,42 @@ fn workers() -> &'static Workers {
 }
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
-/// of them are done. The jobs copy and compare memory; they do not panic.
+/// of them are done. Any panic in a job is propagated to the caller without
+/// deadlocking or losing worker threads.
 fn wide(jobs: Vec<Job>) {
-    if jobs.len() < 2 {
+    if jobs.len() < 2 || IN_WIDE.with(Cell::get) {
         for job in jobs {
             job();
         }
         return;
     }
     let workers = workers();
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let count = jobs.len();
+    let done = Arc::new(WideDone {
+        left: AtomicUsize::new(count),
+        lock: Mutex::new(()),
+        ready: std::sync::Condvar::new(),
+        panic: Mutex::new(None),
+    });
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
-            let left = left.clone();
-            queue.push_back(Box::new(move || {
-                job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
-                }
-            }));
+            queue.push_back((job, done.clone()));
         }
     }
-    workers.more.notify_all();
+    if count == 2 {
+        workers.more.notify_one();
+    } else {
+        workers.more.notify_all();
+    }
     loop {
-        let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-        match job {
-            Some(job) => job(),
+        let next = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        match next {
+            Some((job, item_done)) => item_done.run_job(job),
             None => break,
         }
     }
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
-    }
+    done.wait_and_rethrow();
 }
 
 /// [`wide`], for the host's own work on host copies (a submission's
@@ -1134,10 +1956,12 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
+/// Minimum total bytes before splitting work across [`wide`] workers.
+const WIDE_MIN_SPLIT: usize = 256 << 10;
 
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
-/// (from, to, bytes), taken by [`take_snapshots`].
-static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+/// (from, to, bytes, source is write-combined), taken by [`take_snapshots`].
+static SNAPS: Mutex<Vec<(usize, usize, usize, bool)>> = Mutex::new(Vec::new());
 
 /// With [`wide_back`], when a submission's refreshes are done and before
 /// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
@@ -1147,13 +1971,50 @@ pub(crate) fn take_snapshots() {
     if snaps.is_empty() {
         return;
     }
-    wide(copy_jobs(snaps));
+    wide(copy_jobs_wc(snaps));
 }
 
-/// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
-/// bytes each: long ones cut, short ones together.
+/// `copies` (from, to, bytes) as pieces of work for [`wide`].
+#[cfg(test)]
 fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
+    copy_jobs_wc(
+        copies
+            .into_iter()
+            .map(|(src, dst, len)| (src, dst, len, false))
+            .collect(),
+    )
+}
+
+/// `copies` (from, to, bytes, src_is_wc) as pieces of work up to [`WIDE_JOB`]
+/// bytes each: long ones cut, short ones grouped; medium totals split across
+/// workers instead of serializing into a single job.
+fn copy_jobs_wc(copies: Vec<(usize, usize, usize, bool)>) -> Vec<Job> {
+    let mut cached = Vec::new();
+    let mut wc = Vec::new();
+    for entry in copies {
+        if entry.3 {
+            wc.push((entry.0, entry.1, entry.2));
+        } else {
+            cached.push((entry.0, entry.1, entry.2));
+        }
+    }
+    let total: usize = cached.iter().map(|c| c.2).sum();
+    let target = if total < WIDE_MIN_SPLIT {
+        WIDE_JOB
+    } else {
+        (total / 5).clamp(WIDE_MIN_SPLIT, WIDE_JOB)
+    };
     let mut jobs: Vec<Job> = Vec::new();
+    // Keep all WC BAR reads serialized on one worker so multiple cores never
+    // thrash the PCIe read queue while cached copies run in parallel.
+    if !wc.is_empty() {
+        jobs.push(Box::new(move || {
+            for (src, dst, len) in wc {
+                // SAFETY: a ReBAR WC mapping and its cached snapshot, non-overlapping.
+                unsafe { copy_from_wc(src as *const u8, dst as *mut u8, len) };
+            }
+        }));
+    }
     let mut group: Vec<(usize, usize, usize)> = Vec::new();
     let mut bytes = 0;
     let flush = |group: &mut Vec<(usize, usize, usize)>, jobs: &mut Vec<Job>| {
@@ -1161,21 +2022,20 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
         if !group.is_empty() {
             jobs.push(Box::new(move || {
                 for (src, dst, len) in group {
-                    // SAFETY: the caller's ranges: a host copy's mapping and
-                    // its snapshot, which do not overlap.
+                    // SAFETY: a host copy's mapping and its snapshot, non-overlapping.
                     unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
                 }
             }));
         }
     };
-    for (src, dst, len) in copies {
+    for (src, dst, len) in cached {
         let mut at = 0;
         while at < len {
-            let n = (WIDE_JOB - bytes).min(len - at);
+            let n = (target - bytes).min(len - at);
             group.push((src + at, dst + at, n));
             at += n;
             bytes += n;
-            if bytes >= WIDE_JOB {
+            if bytes >= target {
                 flush(&mut group, &mut jobs);
                 bytes = 0;
             }
@@ -1197,28 +2057,56 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
             match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
-                None => (0, 0, 0, 0, 0),
+                Some(before) => (
+                    shadow.data as usize,
+                    before.as_ptr() as usize,
+                    shadow.start as usize,
+                    from,
+                    to,
+                    shadow.rebar != 0,
+                ),
+                None => (0, 0, 0, 0, 0, false),
             }
         })
         .collect();
-    find_pieces(scans)
+    find_pieces_wc(scans)
 }
 
-/// For each of `scans` (where a copy's bytes are, where its snapshot's
-/// are, the title address the copy starts at, offsets from and to): the
+#[cfg(test)]
+fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
+    find_pieces_wc(
+        scans
+            .into_iter()
+            .map(|(data, before, start, from, to)| (data, before, start, from, to, false))
+            .collect(),
+    )
+}
+
+/// For each of `scans` (copy pointer, snapshot pointer, copy title start,
+/// offsets from and to, whether the copy pointer is write-combined): the
 /// 64 KiB pieces (cut at multiples of 64 KiB of title memory, as
 /// [`Shadow::differing`] cuts them) of `[from, to)` whose bytes differ, as
 /// (offset, bytes) in order. On several threads ([`wide`]), in pieces of
-/// work of about [`WIDE_JOB`] bytes that hold whole pieces.
-fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
+/// work that hold whole pieces.
+fn find_pieces_wc(scans: Vec<(usize, usize, usize, usize, usize, bool)>) -> Vec<Vec<(usize, usize)>> {
     // What a job finds: (which scan, its place among that scan's jobs, the
     // pieces).
     type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
     // A job's part of a scan: the scan, then which and place.
-    type Part = (usize, usize, usize, usize, usize, usize, usize);
+    type Part = (usize, usize, usize, usize, usize, bool, usize, usize);
+    let total_cached: usize = scans
+        .iter()
+        .filter(|s| !s.5)
+        .map(|s| s.4.saturating_sub(s.3))
+        .sum();
+    let target = if total_cached < WIDE_MIN_SPLIT {
+        WIDE_JOB
+    } else {
+        (total_cached / 5).clamp(WIDE_MIN_SPLIT, WIDE_JOB)
+    };
     let found: Arc<Mutex<Found>> = Arc::default();
     let mut jobs: Vec<Job> = Vec::new();
+    let mut wc_group: Vec<Part> = Vec::new();
     let mut group: Vec<Part> = Vec::new();
     let mut bytes = 0;
     let flush = |group: &mut Vec<Part>, jobs: &mut Vec<Job>| {
@@ -1229,7 +2117,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         let found = found.clone();
         jobs.push(Box::new(move || {
             let mut mine: Found = Vec::with_capacity(group.len());
-            for (data, before, start, from, to, which, place) in group {
+            for (data, before, start, from, to, is_wc, which, place) in group {
                 let mut pieces = Vec::new();
                 let mut at = from;
                 while at < to {
@@ -1238,13 +2126,15 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     // (which holds the copy's bytes at the copy's offsets);
                     // nothing writes either while a submission's results
                     // are compared.
-                    let (now, old) = unsafe {
-                        (
-                            std::slice::from_raw_parts((data + at) as *const u8, n),
-                            std::slice::from_raw_parts((before + at) as *const u8, n),
-                        )
+                    let same = if is_wc {
+                        unsafe { slices_equal_wc((data + at) as *const u8, (before + at) as *const u8, n) }
+                    } else {
+                        unsafe {
+                            std::slice::from_raw_parts((data + at) as *const u8, n)
+                                == std::slice::from_raw_parts((before + at) as *const u8, n)
+                        }
                     };
-                    if now != old {
+                    if !same {
                         pieces.push((at, n));
                     }
                     at += n;
@@ -1255,11 +2145,19 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         }));
     };
     let count = scans.len();
-    for (which, (data, before, start, from, to)) in scans.into_iter().enumerate() {
+    for (which, (data, before, start, from, to, is_wc)) in scans.into_iter().enumerate() {
+        if is_wc {
+            // Keep all WC BAR scans in one sequential job so concurrent CPU
+            // cores never contend on the PCIe BAR read queue (~10x faster).
+            if from < to {
+                wc_group.push((data, before, start, from, to, true, which, 0));
+            }
+            continue;
+        }
         let (mut at, mut place) = (from, 0);
         while at < to {
             // Cut where pieces end, so that every job sees whole pieces.
-            let room = (WIDE_JOB - bytes).max(PIECE);
+            let room = (target - bytes).max(PIECE);
             let mut next = (at + room).min(to);
             if next < to {
                 next -= (start + next) % PIECE;
@@ -1267,16 +2165,17 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     next = (at + PIECE - (start + at) % PIECE).min(to);
                 }
             }
-            group.push((data, before, start, at, next, which, place));
+            group.push((data, before, start, at, next, false, which, place));
             bytes += next - at;
             place += 1;
             at = next;
-            if bytes >= WIDE_JOB {
+            if bytes >= target {
                 flush(&mut group, &mut jobs);
                 bytes = 0;
             }
         }
     }
+    flush(&mut wc_group, &mut jobs);
     flush(&mut group, &mut jobs);
     wide(jobs);
     let mut found = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1416,6 +2315,16 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= n`.
+        return unsafe { changed_runs_avx2(&now[..n], &was[..n]) };
+    }
+    changed_runs_scalar(&now[..n], &was[..n])
+}
+
+fn changed_runs_scalar(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
     while i < n {
@@ -1434,6 +2343,64 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
             i += 1;
         }
         runs.push((first, i - first));
+    }
+    runs
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let n = now.len();
+    let (np, wp) = (now.as_ptr(), was.as_ptr());
+    let mut runs = Vec::new();
+    let mut run_start: Option<usize> = None;
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` within both slices.
+        let diff = unsafe {
+            let vn = _mm256_loadu_si256(np.add(i).cast::<__m256i>());
+            let vw = _mm256_loadu_si256(wp.add(i).cast::<__m256i>());
+            !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(vn, vw)) as u32)
+        };
+        if diff == 0 {
+            if let Some(start) = run_start.take() {
+                runs.push((start, i - start));
+            }
+        } else if diff == u32::MAX {
+            run_start.get_or_insert(i);
+        } else {
+            let mut pos = 0usize;
+            while pos < 32 {
+                let rem = diff >> pos;
+                if run_start.is_some() {
+                    let ones = (rem.trailing_ones() as usize).min(32 - pos);
+                    pos += ones;
+                    if pos < 32 {
+                        let start = run_start.take().expect("checked is_some above");
+                        runs.push((start, i + pos - start));
+                    }
+                } else {
+                    if rem == 0 {
+                        break;
+                    }
+                    pos += rem.trailing_zeros() as usize;
+                    run_start = Some(i + pos);
+                }
+            }
+        }
+        i += 32;
+    }
+    while i < n {
+        if now[i] != was[i] {
+            run_start.get_or_insert(i);
+        } else if let Some(start) = run_start.take() {
+            runs.push((start, i - start));
+        }
+        i += 1;
+    }
+    if let Some(start) = run_start {
+        runs.push((start, n - start));
     }
     runs
 }
@@ -1812,6 +2779,7 @@ impl Shadow {
             copied: Mutex::new(CopiedPages::new(pages as usize)),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            has_pending: AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             kept: Mutex::default(),
@@ -1889,16 +2857,25 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.has_pending.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
+        let (init_from, init_to) = self.inside(address, len);
+        let mut parts = Vec::with_capacity(4);
+        if init_from < init_to {
+            parts.push((init_from, init_to));
+        }
+        let mut rest = Vec::with_capacity(4);
         for &(a, e) in pending.iter() {
+            if parts.is_empty() {
+                break;
+            }
             let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
+            rest.clear();
+            for &(from, to) in &parts {
                 if e <= from || a >= to {
                     rest.push((from, to));
                     continue;
@@ -1910,12 +2887,17 @@ impl Shadow {
                     rest.push((e, to));
                 }
             }
-            parts = rest;
+            std::mem::swap(&mut parts, &mut rest);
         }
         pending.push(range);
+        self.has_pending.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
+        if taken == 0 {
+            return;
+        }
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
+        let is_wc = self.rebar != 0;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
@@ -1942,7 +2924,11 @@ impl Shadow {
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        if is_wc {
+                            copy_from_wc(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        } else {
+                            std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        }
                     }
                     kept.0[piece] = whole;
                 }
@@ -1957,7 +2943,12 @@ impl Shadow {
             // range is done with (`copy_back_done`).
             let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
             let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
-            snaps.extend(parts.into_iter().filter(|&(from, to)| from < to).map(|(from, to)| (data + from, snapshot + from, to - from)));
+            snaps.extend(
+                parts
+                    .into_iter()
+                    .filter(|&(from, to)| from < to)
+                    .map(|(from, to)| (data + from, snapshot + from, to - from, is_wc)),
+            );
             return;
         }
         for (from, to) in parts {
@@ -1965,7 +2956,7 @@ impl Shadow {
                 // SAFETY: the copy's mapping and the snapshot's allocation
                 // (`pooled`) both hold `total` bytes, and `to <= total`.
                 unsafe {
-                    copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from);
+                    copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from, is_wc);
                 }
             }
         }
@@ -2018,51 +3009,98 @@ impl Shadow {
                 add(C::BackDiffer, differing.len() as u64);
                 std::time::Instant::now()
             };
+            if differing.is_empty() {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
+                return 0;
+            }
             // Where the copy changes (the GPU wrote, and below the title's
             // bytes come in), a kept snapshot is no longer current.
             for &(at, n) in &differing {
                 self.changed(at, at + n);
             }
-            let mut title = vec![0u8; PIECE];
-            for (at, n) in differing {
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                // From the first byte that differs to the last: title
-                // memory is read and written there only (a shader that sets
-                // a few words of a piece cost a read, a walk and a write of
-                // all 64 KiB of it).
-                let Some(first) = first_difference(host, old) else {
-                    continue;
-                };
-                let last = last_difference(host, old).unwrap_or(first);
-                let (at, n) = (at + first, last + 1 - first);
-                let (host, old) = (&mut host[first..=last], &old[first..=last]);
-                let title = &mut title[..n];
-                if !crate::host::read_into((start + at) as *const u8, title) {
-                    continue;
+            let is_wc = self.rebar != 0;
+            SCRATCH_TITLE.with(|title_cell| {
+                let mut title_buf = title_cell.borrow_mut();
+                if title_buf.len() < PIECE {
+                    title_buf.resize(PIECE, 0);
                 }
-                // Title memory with the GPU's bytes put in; the copy takes
-                // the title's bytes in turn.
-                // Without a branch, so the loop runs many bytes at a time:
-                // the GPU's byte where the copy's byte is not what it was
-                // before the submission, else the title's. (With the two
-                // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
-                }
-                if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
-                }
-            }
+                SCRATCH_WC.with(|wc_cell| {
+                    let mut wc_buf = wc_cell.borrow_mut();
+                    if is_wc && wc_buf.len() < PIECE {
+                        wc_buf.resize(PIECE, 0);
+                    }
+                    for (at, n) in differing {
+                        let old = &before[at - from..at - from + n];
+                        if is_wc {
+                            // Copy WC GPU upload memory into L1-cached scratch ONCE
+                            // via AVX2 streaming loads (`VMOVNTDQA`), diff and merge
+                            // in cached memory, and write back only title-changed
+                            // runs so PCIe never sees uncached byte reads or
+                            // redundant stores.
+                            let wc_slice = &mut wc_buf[..n];
+                            // SAFETY: inside the ReBAR mapping; `n <= PIECE`.
+                            unsafe { copy_from_wc(self.data.add(at), wc_slice.as_mut_ptr(), n) };
+                            let Some(first) = first_difference(wc_slice, old) else {
+                                continue;
+                            };
+                            let last = last_difference(wc_slice, old).unwrap_or(first);
+                            let (at, n) = (at + first, last + 1 - first);
+                            let host_orig = &wc_slice[first..=last];
+                            let old = &old[first..=last];
+                            let title = &mut title_buf[..n];
+                            if !crate::host::read_into((start + at) as *const u8, title) {
+                                continue;
+                            }
+                            // Merge GPU-written bytes into `title` without
+                            // touching `host_orig`: after the merge, `title`
+                            // holds the exact merged bytes (`host_orig` where
+                            // GPU wrote, original `title` elsewhere), so
+                            // `changed_runs(title, host_orig)` yields the exact
+                            // title-modified runs to store back to WC memory.
+                            let differs = merge_gpu_into_title(title, host_orig, old);
+                            for (run_at, run_len) in changed_runs(title, host_orig) {
+                                // SAFETY: inside the ReBAR mapping; sequential WC store.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        title.as_ptr().add(run_at),
+                                        self.data.add(at + run_at),
+                                        run_len,
+                                    );
+                                }
+                            }
+                            if differs {
+                                crate::watch::writing(start + at, n);
+                                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                                written += n;
+                            }
+                        } else {
+                            // SAFETY: inside the mapping; only the submitting thread
+                            // writes it.
+                            let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                            // From the first byte that differs to the last: title
+                            // memory is read and written there only (a shader that sets
+                            // a few words of a piece cost a read, a walk and a write of
+                            // all 64 KiB of it).
+                            let Some(first) = first_difference(host, old) else {
+                                continue;
+                            };
+                            let last = last_difference(host, old).unwrap_or(first);
+                            let (at, n) = (at + first, last + 1 - first);
+                            let (host, old) = (&mut host[first..=last], &old[first..=last]);
+                            let title = &mut title_buf[..n];
+                            if !crate::host::read_into((start + at) as *const u8, title) {
+                                continue;
+                            }
+                            if merge_sync_host(title, host, old) {
+                                crate::watch::writing(start + at, n);
+                                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                                written += n;
+                            }
+                        }
+                    }
+                });
+            });
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
             // frame). Asking about the whole range here, to note them
@@ -2123,7 +3161,11 @@ impl Shadow {
         // room just reserved; the card may write the mapping meanwhile, and
         // each byte read is one it held at some moment.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
+            if self.rebar != 0 {
+                copy_from_wc(self.data.add(at), now.as_mut_ptr(), n);
+            } else {
+                std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
+            }
             now.set_len(n);
         }
         // SAFETY: the snapshot's allocation holds the copy's length
@@ -2137,8 +3179,10 @@ impl Shadow {
         let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        if title.len() < n {
+            title.resize(n, 0);
+        }
+        let title = &mut title[..n];
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
         if !crate::host::read_into((start + at) as *const u8, title) {
@@ -2154,19 +3198,33 @@ impl Shadow {
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
     /// `[from, to)` of the copy that differ from `before` (the bytes from
-    /// `from` on), as (offset, bytes) in order; compared on several threads
-    /// when the range is big.
+    /// `from` on), as (offset, bytes) in order; compared on the kept worker
+    /// pool when the range is big.
     fn differing(&self, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
-        let (start, data) = (self.start as usize, self.data as usize);
-        let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
+        let (start, data, is_wc) = (self.start as usize, self.data as usize, self.rebar != 0);
+        let before_ptr = before.as_ptr() as usize;
+        let scan = move |a: usize, b: usize| -> Vec<(usize, usize)> {
             let mut found = Vec::new();
             let mut at = a;
             while at < b {
                 let n = (PIECE - (start + at) % PIECE).min(b - at);
-                // SAFETY: inside the mapping, which nothing writes while a
-                // submission's results are compared.
-                let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
-                if host != &before[at - from..at - from + n] {
+                // SAFETY: inside the mapping and `before`, which nothing
+                // writes while a submission's results are compared.
+                let same = if is_wc {
+                    unsafe {
+                        slices_equal_wc(
+                            (data + at) as *const u8,
+                            (before_ptr + (at - from)) as *const u8,
+                            n,
+                        )
+                    }
+                } else {
+                    unsafe {
+                        std::slice::from_raw_parts((data + at) as *const u8, n)
+                            == std::slice::from_raw_parts((before_ptr + (at - from)) as *const u8, n)
+                    }
+                };
+                if !same {
                     found.push((at, n));
                 }
                 at += n;
@@ -2174,11 +3232,12 @@ impl Shadow {
             found
         };
         const PER_THREAD: usize = 16 << 20;
-        let threads = ((to - from) / PER_THREAD).clamp(1, 8);
+        // Keep WC PCIe BAR scans single-threaded to avoid multi-core PCIe read thrashing.
+        let threads = if is_wc { 1 } else { ((to - from) / PER_THREAD).clamp(1, 8) };
         if threads == 1 {
             return scan(from, to);
         }
-        // Cut on piece boundaries, so that every thread sees whole pieces.
+        // Cut on piece boundaries, so that every worker sees whole pieces.
         let cut = |i: usize| {
             if i == threads {
                 return to;
@@ -2186,22 +3245,24 @@ impl Shadow {
             let at = from + (to - from) / threads * i;
             (at - (start + at) % PIECE).max(from)
         };
-        let scan = &scan;
-        std::thread::scope(|s| {
-            let parts: Vec<_> = (0..threads)
-                .map(|i| {
-                    let (a, b) = (cut(i), cut(i + 1));
-                    s.spawn(move || scan(a, b))
-                })
-                .collect();
-            parts
-                .into_iter()
-                .flat_map(|part| match part.join() {
-                    Ok(found) => found,
-                    Err(panic) => std::panic::resume_unwind(panic),
-                })
-                .collect()
-        })
+        let parts: Arc<Mutex<Vec<(usize, Vec<(usize, usize)>)>>> =
+            Arc::new(Mutex::new(Vec::with_capacity(threads)));
+        let mut jobs: Vec<Job> = Vec::with_capacity(threads);
+        for i in 0..threads {
+            let (a, b) = (cut(i), cut(i + 1));
+            if a >= b {
+                continue;
+            }
+            let parts = parts.clone();
+            jobs.push(Box::new(move || {
+                let mine = scan(a, b);
+                parts.lock().unwrap_or_else(|e| e.into_inner()).push((i, mine));
+            }));
+        }
+        wide(jobs);
+        let mut parts = std::mem::take(&mut *parts.lock().unwrap_or_else(|e| e.into_inner()));
+        parts.sort_unstable_by_key(|p| p.0);
+        parts.into_iter().flat_map(|(_, found)| found).collect()
     }
 
     /// After [`Shadow::copy_back`] of a submission's ranges: every submitted
@@ -2223,6 +3284,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.has_pending.store(!pending.is_empty(), Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -2280,7 +3342,7 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.has_pending.load(Ordering::Acquire)
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -2295,6 +3357,9 @@ impl Shadow {
     /// (`crate::host::late`): the ranges are those of flights in the air,
     /// which are then settled before this refresh.
     pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
+        if !self.has_pending.load(Ordering::Acquire) {
+            return false;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -2341,6 +3406,9 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        if !self.has_pending.load(Ordering::Acquire) {
+            return false;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -2361,92 +3429,100 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
-        let mut title = vec![0u8; PAGE];
-        for (a, e) in busy {
-            // As the refresh itself asks (`update_free`): the journal if
-            // the submission's asking covered the range, else the kernel,
-            // else the guards. The journal alone said nothing for copies
-            // of view memory, which is guarded and not write-watched, and
-            // those were all of run 99's cases: the flights were settled
-            // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                return true;
-            };
-            let stale: Vec<usize> = {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                written
-                    .into_iter()
-                    .filter(|&(page, write)| page >= base && copied.get(page - base).is_none_or(|at| at == 0 || write > at))
-                    .map(|(page, _)| page)
-                    .collect()
-            };
-            for page in stale {
-                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
-                if lo >= hi {
+        SCRATCH_TITLE.with(|title_cell| {
+            let mut title_buf = title_cell.borrow_mut();
+            for (a, e) in busy {
+                // As the refresh itself asks (`update_free`): the journal if
+                // the submission's asking covered the range, else the kernel,
+                // else the guards. The journal alone said nothing for copies
+                // of view memory, which is guarded and not write-watched, and
+                // those were all of run 99's cases: the flights were settled
+                // 4-5 times a frame for "0 pages looked at".
+                let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                    return true;
+                };
+                let stale: Vec<usize> = {
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    written
+                        .into_iter()
+                        .filter(|&(page, write)| page >= base && copied.get(page - base).is_none_or(|at| at == 0 || write > at))
+                        .map(|(page, _)| page)
+                        .collect()
+                };
+                if stale.is_empty() {
                     continue;
                 }
-                let n = hi - lo;
-                let title = &mut title[..n];
-                // The lock of the copy's reference (the snapshot, or the
-                // CPU's side of a copy in the card's memory), from before
-                // title memory is read until the title's bytes are in: with
-                // the copy-back on its own thread ([`relay`]) that thread
-                // puts what the card wrote into title memory and into the
-                // reference under the same lock, and a page read before
-                // such a merge and compared after it would take the card's
-                // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-                // A page that is not there is left as it is, and looked at
-                // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
-                    continue;
+                if title_buf.len() < PAGE {
+                    title_buf.resize(PAGE, 0);
                 }
-                MERGED[0].fetch_add(1, Ordering::Relaxed);
-                let at = lo - start;
-                if self.card.is_some() {
-                    // SAFETY: inside the mapping of the copy's CPU side,
-                    // which only the submitting thread writes.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
-                    if runs.len() > *runs_left {
-                        return true;
+                for page in stale {
+                    let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                    if lo >= hi {
+                        continue;
                     }
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    let n = hi - lo;
+                    let title = &mut title_buf[..n];
+                    // The lock of the copy's reference (the snapshot, or the
+                    // CPU's side of a copy in the card's memory), from before
+                    // title memory is read until the title's bytes are in: with
+                    // the copy-back on its own thread ([`relay`]) that thread
+                    // puts what the card wrote into title memory and into the
+                    // reference under the same lock, and a page read before
+                    // such a merge and compared after it would take the card's
+                    // bytes for the title's.
+                    let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                    // A page that is not there is left as it is, and looked at
+                    // again next time.
+                    if !crate::host::read_into(lo as *const u8, title) {
+                        continue;
                     }
-                } else {
-                    let Some(snapshot) = before.as_mut() else {
-                        return true;
-                    };
-                    // SAFETY: the snapshot's allocation holds the copy's
-                    // bytes at the copy's offsets (`writing`), and these
-                    // are in a declared range.
-                    let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
-                        // SAFETY: inside the copy's mapping. The card may be
-                        // writing the copy beside these bytes; they are
-                        // written here and nothing around them.
-                        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    MERGED[0].fetch_add(1, Ordering::Relaxed);
+                    let at = lo - start;
+                    if self.card.is_some() {
+                        // SAFETY: inside the mapping of the copy's CPU side,
+                        // which only the submitting thread writes.
+                        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                        let runs = changed_runs(title, held);
+                        if runs.len() > *runs_left {
+                            return true;
+                        }
+                        *runs_left -= runs.len();
+                        for (r, m) in runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            self.card_changed(at + r, at + r + m);
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
+                    } else {
+                        let Some(snapshot) = before.as_mut() else {
+                            return true;
+                        };
+                        // SAFETY: the snapshot's allocation holds the copy's
+                        // bytes at the copy's offsets (`writing`), and these
+                        // are in a declared range.
+                        let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+                        for (r, m) in changed_runs(title, held) {
+                            // SAFETY: inside the copy's mapping. The card may be
+                            // writing the copy beside these bytes; they are
+                            // written here and nothing around them.
+                            unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
                     }
-                }
-                drop(before);
-                // Taken, if the range holds all of the page that is in the
-                // copy; else the rest of it is the refresh's, which notes
-                // only whole pages, and the page is looked at again.
-                if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
-                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    copied.set(page - base, now);
+                    drop(before);
+                    // Taken, if the range holds all of the page that is in the
+                    // copy; else the rest of it is the refresh's, which notes
+                    // only whole pages, and the page is looked at again.
+                    if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                        copied.set(page - base, now);
+                    }
                 }
             }
-        }
-        false
+            false
+        })
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -2461,6 +3537,9 @@ impl Shadow {
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
             return 0;
+        }
+        if !self.has_pending.load(Ordering::Acquire) {
+            return self.update_free(from, to);
         }
         let mut busy: Vec<(usize, usize)> = self
             .pending
@@ -2546,14 +3625,21 @@ impl Shadow {
         static DIFFERING: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
         static SAID: AtomicU64 = AtomicU64::new(0);
         let start = self.start as usize;
+        let is_wc = self.rebar != 0;
         let mut title = [0u8; SAMPLE];
+        let mut wc_sample = [0u8; SAMPLE];
         let mut at = from;
         while at < to {
             let n = SAMPLE.min(to - at);
             if crate::host::read_into(at as *const u8, &mut title[..n]) {
                 // SAFETY: `[from, to)` lies inside the buffer (`update`),
                 // so these bytes are inside the copy's mapping.
-                let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+                let copy = if is_wc {
+                    unsafe { copy_from_wc(self.data.add(at - start).cast_const(), wc_sample.as_mut_ptr(), n) };
+                    &wc_sample[..n]
+                } else {
+                    unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) }
+                };
                 let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
                 let map = map.get_or_insert_with(Default::default);
                 if copy == &title[..n] {
@@ -2586,80 +3672,18 @@ impl Shadow {
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
+    /// asking), whole pages within the buffer. Plans coalesced runs under
+    /// `self.copied`, then releases the mutex before executing the copies.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let first_page = from / PAGE;
-        let last = (to - 1) / PAGE;
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Fast path: once every page of the copy has been initialized at least
-        // once, skip untouched pages completely — O(1) when `written` is empty
-        // and O(|written|) otherwise (instead of O((to - from) / PAGE)).
-        if copied.all_copied() {
-            if written.is_empty() {
-                return 0;
-            }
-            let mut bytes = 0;
-            let mut run: Option<(usize, usize)> = None;
-            for &(page, write) in written {
-                if page < first_page || page > last {
-                    continue;
-                }
-                let at = copied.at[page - base];
-                if write <= at {
-                    continue;
-                }
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    copied.set(page - base, now);
-                }
-                match run {
-                    Some((_, run_end)) if page < run_end => {}
-                    Some((run_start, run_end)) if page == run_end => {
-                        run = Some((run_start, page + 1));
-                    }
-                    Some((run_start, run_end)) => {
-                        bytes += self.copy((run_start * PAGE).max(from), (run_end * PAGE).min(to));
-                        run = Some((page, page + 1));
-                    }
-                    None => run = Some((page, page + 1)),
-                }
-            }
-            if let Some((run_start, run_end)) = run {
-                bytes += self.copy((run_start * PAGE).max(from), (run_end * PAGE).min(to));
-            }
-            return bytes;
-        }
-
-        let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
-        for page in first_page..=last {
-            while writes.peek().is_some_and(|&&(p, _)| p < page) {
-                writes.next();
-            }
-            let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
-                    writes.next();
-                    w
-                }
-                _ => 0,
-            };
-            let at = copied.at[page - base];
-            if at == 0 || write > at {
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    copied.set(page - base, now);
-                }
-                run.get_or_insert(page);
-            } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
-            }
-        }
-        // Cut to the range: next to it shaders may be writing the copy.
-        if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        let runs = {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            copied.plan_stale(base, start, end, from, to, now, written)
+        };
+        let mut bytes = 0;
+        for (run_from, run_to) in runs.iter() {
+            bytes += self.copy(run_from, run_to);
         }
         bytes
     }
@@ -2697,6 +3721,7 @@ impl Shadow {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
         }
+        card.has_dirty.store(true, Ordering::Release);
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -2804,21 +3829,13 @@ impl Shadow {
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        if title.len() < n {
+            title.resize(n, 0);
+        }
+        let title = &mut title[..n];
         let mut written = 0;
         if crate::host::read_into((start + at) as *const u8, title) {
-            // As in `copy_back`: the card's byte where it is not what it
-            // was before the submission, else the title's.
-            let mut differs = 0u8;
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
-                *t = merged;
-                *o = merged;
-            }
-            if differs != 0 {
+            if merge_sync_card(title, gpu, old) {
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
@@ -2871,18 +3888,27 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
-        let skip: Vec<(usize, usize)> = {
-            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            dirty
-                .iter()
-                .copied()
-                .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
-                .filter(|&(a, b)| a < at + n && b > at)
-                .collect()
-        };
-        title.clear();
-        title.resize(n, 0);
+        // Check `has_dirty` FIRST, then `has_sent`: `card_dirty` sets
+        // `has_sent` (Release) before clearing `has_dirty` (Release), so
+        // observing `has_dirty == false` guarantees observing `has_sent == true`
+        // for any range transitioning from `dirty` to `sent`.
+        let skip: Vec<(usize, usize)> =
+            if !card.has_dirty.load(Ordering::Acquire) && !card.has_sent.load(Ordering::Acquire) {
+                Vec::new()
+            } else {
+                let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+                let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+                dirty
+                    .iter()
+                    .copied()
+                    .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
+                    .filter(|&(a, b)| a < at + n && b > at)
+                    .collect()
+            };
+        if title.len() < n {
+            title.resize(n, 0);
+        }
+        let title = &mut title[..n];
         let mapped = crate::host::read_into((start + at) as *const u8, title);
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
@@ -3090,7 +4116,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     staging: buffer,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
+                    has_dirty: AtomicBool::new(false),
                     sent: Mutex::default(),
+                    has_sent: AtomicBool::new(false),
                     size,
                 };
                 (on_card, Some(card))
@@ -3141,13 +4169,9 @@ fn rebar_copy(kind: crate::rebar::Kind, start: u64, len: u64, size: u64, window:
             );
         });
     }
-    if !crate::rebar::reserve(kind, size, cpu_read) {
-        return None;
-    }
-    let Some((buffer, data)) = host()?.gpu_upload_buffer(size) else {
-        crate::rebar::released(size);
-        return None;
-    };
+    let reservation = crate::rebar::reserve(kind, size, cpu_read)?;
+    let (buffer, data) = host()?.gpu_upload_buffer(size)?;
+    let reserved = reservation.commit();
     crate::host::name(&buffer, || {
         format!(
             "title {} {start:#x}+{len:#x} (rebar)",
@@ -3158,7 +4182,7 @@ fn rebar_copy(kind: crate::rebar::Kind, start: u64, len: u64, size: u64, window:
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = window;
-    shadow.rebar = size;
+    shadow.rebar = reserved;
     Some(Arc::new(shadow))
 }
 
@@ -3363,7 +4387,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 staging: buffer,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
+                has_dirty: AtomicBool::new(false),
                 sent: Mutex::default(),
+                has_sent: AtomicBool::new(false),
                 size: len,
             };
             (on_card, Some(card))
@@ -3513,6 +4539,742 @@ mod window_tests {
         pages.set(1, 0);
         assert!(!pages.all_copied());
         assert_eq!(pages.copied_count(), 3);
+    }
+
+    /// Reference oracle matching the original O(range) page-by-page `copy_stale`
+    /// loop, used to prove `CopiedPages::plan_stale` is bit-for-bit identical
+    /// across all alignments, partial pages, duplicates, and word boundaries.
+    #[allow(clippy::too_many_arguments)]
+    fn oracle_plan_stale(
+        at_vec: &mut [u64],
+        base: usize,
+        start: usize,
+        end: usize,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+    ) -> Vec<(usize, usize)> {
+        use super::PAGE;
+        let first_page = from / PAGE;
+        let last = (to - 1) / PAGE;
+        let mut writes = written.iter().peekable();
+        let mut out = Vec::new();
+        let mut run: Option<usize> = None;
+        for page in first_page..=last {
+            while writes.peek().is_some_and(|&&(p, _)| p < page) {
+                writes.next();
+            }
+            let write = match writes.peek() {
+                Some(&&(p, w)) if p == page => {
+                    writes.next();
+                    // Consume any duplicates for the same page, keeping max write seq.
+                    let mut best = w;
+                    while let Some(&&(p2, w2)) = writes.peek() {
+                        if p2 != page {
+                            break;
+                        }
+                        writes.next();
+                        best = best.max(w2);
+                    }
+                    best
+                }
+                _ => 0,
+            };
+            let cur = at_vec[page - base];
+            if cur == 0 || write > cur {
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    at_vec[page - base] = now;
+                }
+                run.get_or_insert(page);
+            } else if let Some(first) = run.take() {
+                out.push(((first * PAGE).max(from), (page * PAGE).min(to)));
+            }
+        }
+        if let Some(first) = run {
+            out.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to)));
+        }
+        out
+    }
+
+    #[test]
+    fn plan_stale_matches_oracle_across_boundaries_and_partial_init() {
+        use super::{CopiedPages, PAGE};
+        // Span 3 bitmask words (> 128 pages) with unaligned start & end.
+        let start = 10 * PAGE + 0x1234;
+        let len = 140 * PAGE + 0x5678;
+        let end = start + len;
+        let base = start / PAGE;
+        let pages_total = (end.div_ceil(PAGE)) - base;
+
+        let mut cp = CopiedPages::new(pages_total);
+        let mut oracle = vec![0u64; pages_total];
+
+        // Partially initialize several subranges across 64-page word boundaries.
+        for idx in (0..64).chain(65..128).chain(130..135) {
+            cp.set(idx, 10);
+            oracle[idx] = 10;
+        }
+        assert!(!cp.all_copied());
+        assert!(cp.range_all_copied(0, 63));
+        assert!(!cp.range_all_copied(0, 64));
+        assert!(cp.range_all_copied(65, 127));
+        assert!(!cp.range_all_copied(64, 127));
+        assert_eq!(cp.next_uncopied(0, pages_total - 1), Some(64));
+        assert_eq!(cp.next_uncopied(65, pages_total - 1), Some(128));
+
+        let cases: &[((usize, usize), u64, &[(usize, u64)])] = &[
+            // Fully initialized subrange, no writes -> empty runs.
+            ((start, start + 60 * PAGE), 20, &[]),
+            // Fully initialized subrange with stale and fresh writes + out-of-range writes.
+            (
+                (start + 2 * PAGE, start + 62 * PAGE),
+                21,
+                &[
+                    (base, 99),
+                    (base + 5, 10),
+                    (base + 6, 15),
+                    (base + 7, 16),
+                    (base + 20, 19),
+                    (base + 139, 99),
+                ],
+            ),
+            // Partial page edges (should copy bytes without marking partial pages copied).
+            (
+                (start + 64 * PAGE + 128, start + 64 * PAGE + 4096),
+                22,
+                &[(base + 64, 22)],
+            ),
+            // Mixed uncopied + written + already-copied across all 3 words.
+            (
+                (start + 50 * PAGE, start + 136 * PAGE),
+                25,
+                &[
+                    (base + 52, 23),
+                    (base + 63, 24),
+                    (base + 64, 24),
+                    (base + 65, 24),
+                    (base + 127, 25),
+                    (base + 128, 25),
+                    (base + 131, 5),
+                ],
+            ),
+            // Whole buffer sweep, including tail partial page.
+            ((start, end), 30, &[(base + 10, 29), (base + 140, 29)]),
+        ];
+
+        for &((from, to), now, written) in cases {
+            let got: Vec<(usize, usize)> = cp
+                .plan_stale(base, start, end, from, to, now, written)
+                .iter()
+                .collect();
+            let want = oracle_plan_stale(&mut oracle, base, start, end, from, to, now, written);
+            assert_eq!(got, want, "range {from:#x}..{to:#x} now={now}");
+            assert_eq!(cp.at, oracle, "copied timestamps diverged at now={now}");
+            let expected_uncopied = oracle.iter().filter(|&&v| v == 0).count();
+            assert_eq!(cp.uncopied, expected_uncopied);
+        }
+        assert!(cp.all_copied());
+    }
+
+    #[test]
+    fn simd_diff_merge_and_wc_helpers_match_scalar_oracles() {
+        use super::{
+            changed_runs, changed_runs_scalar, copy_from_wc, first_difference,
+            first_difference_scalar, last_difference, last_difference_scalar,
+            merge_gpu_into_title, merge_gpu_into_title_scalar, merge_piece, merge_piece_scalar,
+            merge_sync_card, merge_sync_card_scalar, merge_sync_host, merge_sync_host_scalar,
+            slices_equal_wc,
+        };
+
+        // Test lengths covering <32, exact 32, unaligned tails, and multi-vector spans.
+        for len in [0usize, 1, 7, 15, 31, 32, 33, 63, 64, 65, 95, 96, 129, 257, 1024] {
+            let old: Vec<u8> = (0..len).map(|i| ((i * 37 + 11) & 0xff) as u8).collect();
+            let mut gpu = old.clone();
+            let mut title = old.clone();
+            for i in 0..len {
+                if i % 19 == 0 || i == len.saturating_sub(1) || ((30..66).contains(&i) && i % 3 == 0) {
+                    gpu[i] ^= 0x5a;
+                }
+                if i % 23 == 0 || ((16..80).contains(&i) && i % 5 == 0) {
+                    title[i] ^= 0xa5;
+                }
+            }
+
+            // first_difference / last_difference
+            assert_eq!(first_difference(&gpu, &old), first_difference_scalar(&gpu, &old), "len={len}");
+            assert_eq!(last_difference(&gpu, &old), last_difference_scalar(&gpu, &old), "len={len}");
+            assert_eq!(first_difference(&old, &old), None);
+            assert_eq!(last_difference(&old, &old), None);
+
+            // changed_runs
+            assert_eq!(changed_runs(&gpu, &old), changed_runs_scalar(&gpu, &old), "len={len}");
+            assert_eq!(changed_runs(&old, &old), Vec::<(usize, usize)>::new());
+
+            // merge_piece
+            let (mut h1, mut t1) = (old.clone(), title.clone());
+            let (mut h2, mut t2) = (old.clone(), title.clone());
+            assert_eq!(
+                merge_piece(&gpu, &mut h1, &mut t1),
+                merge_piece_scalar(&gpu, &mut h2, &mut t2),
+                "merge_piece ret len={len}"
+            );
+            assert_eq!((&h1, &t1), (&h2, &t2), "merge_piece bytes len={len}");
+
+            // merge_sync_host
+            let (mut host1, mut t1) = (gpu.clone(), title.clone());
+            let (mut host2, mut t2) = (gpu.clone(), title.clone());
+            assert_eq!(
+                merge_sync_host(&mut t1, &mut host1, &old),
+                merge_sync_host_scalar(&mut t2, &mut host2, &old),
+                "merge_sync_host ret len={len}"
+            );
+            assert_eq!((&host1, &t1), (&host2, &t2), "merge_sync_host bytes len={len}");
+
+            // merge_sync_card
+            let (mut old1, mut t1) = (old.clone(), title.clone());
+            let (mut old2, mut t2) = (old.clone(), title.clone());
+            assert_eq!(
+                merge_sync_card(&mut t1, &gpu, &mut old1),
+                merge_sync_card_scalar(&mut t2, &gpu, &mut old2),
+                "merge_sync_card ret len={len}"
+            );
+            assert_eq!((&old1, &t1), (&old2, &t2), "merge_sync_card bytes len={len}");
+
+            // merge_gpu_into_title + changed_runs WC writeback equivalence
+            let (mut t1, mut t2) = (title.clone(), title.clone());
+            assert_eq!(
+                merge_gpu_into_title(&mut t1, &gpu, &old),
+                merge_gpu_into_title_scalar(&mut t2, &gpu, &old),
+                "merge_gpu_into_title ret len={len}"
+            );
+            assert_eq!(t1, t2);
+            let mut wc_reconstructed = gpu.clone();
+            for (r, m) in changed_runs(&t1, &gpu) {
+                wc_reconstructed[r..r + m].copy_from_slice(&t1[r..r + m]);
+            }
+            assert_eq!(wc_reconstructed, host1, "WC writeback must equal merge_sync_host");
+
+            // copy_from_wc / slices_equal_wc across misaligned source offsets 0..32
+            for shift in [0usize, 1, 7, 16, 31] {
+                if shift > len {
+                    continue;
+                }
+                let sub = &gpu[shift..];
+                let mut copied = vec![0xeeu8; sub.len()];
+                // SAFETY: valid non-overlapping slices of length `sub.len()`.
+                unsafe { copy_from_wc(sub.as_ptr(), copied.as_mut_ptr(), sub.len()) };
+                assert_eq!(&copied[..], sub, "copy_from_wc len={len} shift={shift}");
+                // SAFETY: valid readable slices of length `sub.len()`.
+                assert!(unsafe { slices_equal_wc(sub.as_ptr(), copied.as_ptr(), sub.len()) });
+                if !copied.is_empty() {
+                    let flip = copied.len() / 2;
+                    copied[flip] ^= 1;
+                    // SAFETY: valid readable slices of length `sub.len()`.
+                    assert!(!unsafe { slices_equal_wc(sub.as_ptr(), copied.as_ptr(), sub.len()) });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_wide_runs_without_deadlock() {
+        use super::{Job, wide};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sum = Arc::new(AtomicUsize::new(0));
+        let outer: Vec<Job> = (0..8)
+            .map(|_| {
+                let sum = sum.clone();
+                Box::new(move || {
+                    let inner: Vec<Job> = (0..4)
+                        .map(|_| {
+                            let sum = sum.clone();
+                            Box::new(move || {
+                                sum.fetch_add(1, Ordering::Relaxed);
+                            }) as Job
+                        })
+                        .collect();
+                    wide(inner);
+                }) as Job
+            })
+            .collect();
+        wide(outer);
+        assert_eq!(sum.load(Ordering::Relaxed), 32);
+    }
+
+    #[test]
+    fn wide_propagates_worker_panic_without_deadlocking_pool() {
+        use super::{Job, wide};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let panic_res = std::panic::catch_unwind(|| {
+            let jobs: Vec<Job> = (0..8)
+                .map(|i| {
+                    Box::new(move || {
+                        if i == 3 {
+                            panic!("synthetic wide worker panic");
+                        }
+                    }) as Job
+                })
+                .collect();
+            wide(jobs);
+        });
+        assert!(panic_res.is_err(), "worker panic must propagate to caller");
+
+        // Pool must remain healthy and non-deadlocked on subsequent batches.
+        let ran = Arc::new(AtomicUsize::new(0));
+        let jobs: Vec<Job> = (0..16)
+            .map(|_| {
+                let ran = ran.clone();
+                Box::new(move || {
+                    ran.fetch_add(1, Ordering::Relaxed);
+                }) as Job
+            })
+            .collect();
+        wide(jobs);
+        assert_eq!(ran.load(Ordering::Relaxed), 16);
+    }
+
+    /// End-to-end release benchmarks comparing BEFORE (baseline scalar/unindexed)
+    /// vs AFTER (bitmask + AVX2 + VMOVNTDQA) on CPU and real D3D12 ReBAR /
+    /// shared buffers. Run with:
+    /// `cargo test --release -p victory-gpu --locked -- --ignored --nocapture bench_shadow_and_rebar`
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_shadow_and_rebar() {
+        use super::{
+            CopiedPages, PAGE, PIECE, changed_runs, changed_runs_scalar, copy_from_wc,
+            first_difference, first_difference_scalar, last_difference, last_difference_scalar,
+            merge_piece, merge_sync_host, slices_equal_wc,
+        };
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // 1. `copy_stale` planning on a partially-initialized 174 MiB buffer
+        //    (2,784 pages; 2,500 initialized, 284 uncopied at the tail).
+        const PAGES: usize = 2784;
+        let base = 0x1000usize;
+        let start = base * PAGE;
+        let end = start + PAGES * PAGE;
+        let query_from = start;
+        let query_to = start + 2400 * PAGE; // 150 MiB initialized subrange
+        let dirty_8: Vec<(usize, u64)> = (0..8).map(|i| (base + i * 250 + 17, 50)).collect();
+
+        let mut cp = CopiedPages::new(PAGES);
+        let mut oracle_at = vec![0u64; PAGES];
+        for i in 0..2500 {
+            cp.set(i, 10);
+            oracle_at[i] = 10;
+        }
+        const PLAN_ITERS: usize = 10_000;
+        // Baseline O(range) scan when buffer is not 100% initialized.
+        let t0 = Instant::now();
+        let mut acc = 0usize;
+        for iter in 0..PLAN_ITERS {
+            let now = 100 + iter as u64;
+            let runs = oracle_plan_stale(
+                &mut oracle_at,
+                base,
+                start,
+                end,
+                query_from,
+                query_to,
+                now,
+                &[],
+            );
+            acc += runs.len();
+        }
+        let before_clean = t0.elapsed();
+        black_box(acc);
+
+        let t0 = Instant::now();
+        let mut acc = 0usize;
+        for iter in 0..PLAN_ITERS {
+            let now = 100 + iter as u64;
+            let runs = cp.plan_stale(base, start, end, query_from, query_to, now, &[]);
+            acc += runs.iter().count();
+        }
+        let after_clean = t0.elapsed();
+        black_box(acc);
+
+        // Dirty 8 pages in the 150 MiB subrange.
+        let t0 = Instant::now();
+        let mut acc = 0usize;
+        for iter in 0..PLAN_ITERS {
+            let now = 200_000 + iter as u64 * 2;
+            let w: Vec<(usize, u64)> = dirty_8.iter().map(|&(p, _)| (p, now - 1)).collect();
+            let runs = oracle_plan_stale(
+                &mut oracle_at,
+                base,
+                start,
+                end,
+                query_from,
+                query_to,
+                now,
+                &w,
+            );
+            acc += runs.len();
+        }
+        let before_dirty = t0.elapsed();
+        black_box(acc);
+
+        let t0 = Instant::now();
+        let mut acc = 0usize;
+        for iter in 0..PLAN_ITERS {
+            let now = 200_000 + iter as u64 * 2;
+            let w: Vec<(usize, u64)> = dirty_8.iter().map(|&(p, _)| (p, now - 1)).collect();
+            let runs = cp.plan_stale(base, start, end, query_from, query_to, now, &w);
+            acc += runs.iter().count();
+        }
+        let after_dirty = t0.elapsed();
+        black_box(acc);
+
+        println!(
+            "[BENCH] copy_stale 150MiB clean (10k iters): before={before_clean:?}, after={after_clean:?} ({:.1}x)",
+            before_clean.as_secs_f64() / after_clean.as_secs_f64()
+        );
+        println!(
+            "[BENCH] copy_stale 150MiB 8-dirty (10k iters): before={before_dirty:?}, after={after_dirty:?} ({:.1}x)",
+            before_dirty.as_secs_f64() / after_dirty.as_secs_f64()
+        );
+
+        // 2. Copy-back piece diff + merge (970 x 64 KiB pieces ~= 60 MiB/frame,
+        //    sparse shader writes in the middle and edges of each piece).
+        //    Keep buffer resets outside the timed merge loops so setup memcpy
+        //    does not dilute the actual merge measurement.
+        const PIECES: usize = 970;
+        let old: Vec<u8> = (0..PIECE).map(|i| (i * 13 + 7) as u8).collect();
+        let mut gpu_mid = old.clone();
+        for at in 28 * 1024..36 * 1024 {
+            gpu_mid[at] ^= 0x3c;
+        }
+        let mut gpu_sparse = old.clone();
+        for at in (64..320).chain(PIECE - 320..PIECE - 64) {
+            gpu_sparse[at] ^= 0x3c;
+        }
+
+        // first_difference + last_difference on mid-piece shader writes (28 KiB..36 KiB)
+        let t0 = Instant::now();
+        let mut s = 0usize;
+        for _ in 0..PIECES * 4 {
+            s += first_difference_scalar(black_box(&gpu_mid), black_box(&old)).unwrap_or(0);
+            s += last_difference_scalar(black_box(&gpu_mid), black_box(&old)).unwrap_or(0);
+        }
+        let before_diff = t0.elapsed();
+        black_box(s);
+
+        let t0 = Instant::now();
+        let mut s = 0usize;
+        for _ in 0..PIECES * 4 {
+            s += first_difference(black_box(&gpu_mid), black_box(&old)).unwrap_or(0);
+            s += last_difference(black_box(&gpu_mid), black_box(&old)).unwrap_or(0);
+        }
+        let after_diff = t0.elapsed();
+        black_box(s);
+        println!(
+            "[BENCH] first+last_difference mid-piece (3880x64KiB): before={before_diff:?}, after={after_diff:?} ({:.1}x)",
+            before_diff.as_secs_f64() / after_diff.as_secs_f64()
+        );
+
+        // merge_piece (relay_merge / card_merge_relay) — baseline branchless byte loop vs AVX2
+        let baseline_merge_piece = |now: &[u8], held: &mut [u8], title: &mut [u8]| -> bool {
+            let mut differs = 0u8;
+            for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+                let wrote = if *n != *h { 0xffu8 } else { 0 };
+                let merged = (*t & !wrote) | (*n & wrote);
+                differs |= merged ^ *t;
+                *t = merged;
+                *h = (*h & !wrote) | (*n & wrote);
+            }
+            differs != 0
+        };
+        let mut held = old.clone();
+        let mut title = old.clone();
+        let t0 = Instant::now();
+        let mut hits = 0usize;
+        for _ in 0..PIECES {
+            // Reset only the 512 changed bytes so setup stays O(512) instead of O(128 KiB).
+            held[64..320].copy_from_slice(&old[64..320]);
+            held[PIECE - 320..PIECE - 64].copy_from_slice(&old[PIECE - 320..PIECE - 64]);
+            title[64..320].copy_from_slice(&old[64..320]);
+            title[PIECE - 320..PIECE - 64].copy_from_slice(&old[PIECE - 320..PIECE - 64]);
+            if baseline_merge_piece(black_box(&gpu_sparse), black_box(&mut held), black_box(&mut title)) {
+                hits += 1;
+            }
+        }
+        let before_mp = t0.elapsed();
+        black_box(hits);
+
+        held.copy_from_slice(&old);
+        title.copy_from_slice(&old);
+        let t0 = Instant::now();
+        let mut hits = 0usize;
+        for _ in 0..PIECES {
+            held[64..320].copy_from_slice(&old[64..320]);
+            held[PIECE - 320..PIECE - 64].copy_from_slice(&old[PIECE - 320..PIECE - 64]);
+            title[64..320].copy_from_slice(&old[64..320]);
+            title[PIECE - 320..PIECE - 64].copy_from_slice(&old[PIECE - 320..PIECE - 64]);
+            if merge_piece(black_box(&gpu_sparse), black_box(&mut held), black_box(&mut title)) {
+                hits += 1;
+            }
+        }
+        let after_mp = t0.elapsed();
+        black_box(hits);
+        println!(
+            "[BENCH] merge_piece sparse (970x64KiB ~= 60MiB): before={before_mp:?}, after={after_mp:?} ({:.1}x)",
+            before_mp.as_secs_f64() / after_mp.as_secs_f64()
+        );
+
+        // merge_sync_host (copy_back_with) — baseline byte loop vs AVX2
+        let baseline_sync = |title: &mut [u8], host: &mut [u8], old: &[u8]| -> bool {
+            let mut differs = 0u8;
+            for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                let gpu = if *h != *o { 0xffu8 } else { 0 };
+                let merged = (*t & !gpu) | (*h & gpu);
+                differs |= merged ^ *t;
+                *t = merged;
+                *h = merged;
+            }
+            differs != 0
+        };
+        let mut host_buf = gpu_sparse.clone();
+        title.copy_from_slice(&old);
+        let t0 = Instant::now();
+        let mut hits = 0usize;
+        for _ in 0..PIECES {
+            title[64..320].copy_from_slice(&old[64..320]);
+            title[PIECE - 320..PIECE - 64].copy_from_slice(&old[PIECE - 320..PIECE - 64]);
+            if baseline_sync(black_box(&mut title), black_box(&mut host_buf), black_box(&old)) {
+                hits += 1;
+            }
+        }
+        let before_sync = t0.elapsed();
+        black_box(hits);
+
+        host_buf.copy_from_slice(&gpu_sparse);
+        title.copy_from_slice(&old);
+        let t0 = Instant::now();
+        let mut hits = 0usize;
+        for _ in 0..PIECES {
+            title[64..320].copy_from_slice(&old[64..320]);
+            title[PIECE - 320..PIECE - 64].copy_from_slice(&old[PIECE - 320..PIECE - 64]);
+            if merge_sync_host(black_box(&mut title), black_box(&mut host_buf), black_box(&old)) {
+                hits += 1;
+            }
+        }
+        let after_sync = t0.elapsed();
+        black_box(hits);
+        println!(
+            "[BENCH] copy_back merge_sync_host sparse (970x64KiB ~= 60MiB): before={before_sync:?}, after={after_sync:?} ({:.1}x)",
+            before_sync.as_secs_f64() / after_sync.as_secs_f64()
+        );
+
+        // changed_runs (merge_under_writes)
+        let t0 = Instant::now();
+        let mut total_runs = 0usize;
+        for _ in 0..PIECES * 2 {
+            total_runs += changed_runs_scalar(black_box(&gpu_sparse), black_box(&old)).len();
+        }
+        let before_cr = t0.elapsed();
+        black_box(total_runs);
+
+        let t0 = Instant::now();
+        let mut total_runs = 0usize;
+        for _ in 0..PIECES * 2 {
+            total_runs += changed_runs(black_box(&gpu_sparse), black_box(&old)).len();
+        }
+        let after_cr = t0.elapsed();
+        black_box(total_runs);
+        println!(
+            "[BENCH] changed_runs (1940x64KiB): before={before_cr:?}, after={after_cr:?} ({:.1}x)",
+            before_cr.as_secs_f64() / after_cr.as_secs_f64()
+        );
+
+        // 3. Real GPU hardware ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) vs shared
+        //    heap (`D3D12_HEAP_TYPE_CUSTOM` L0 WB) read/write/compare/copy_back
+        //    throughput on this exact GPU.
+        let Some(host) = crate::host::host() else {
+            println!("[BENCH] no host D3D12 device");
+            return;
+        };
+        const BUF_LEN: usize = 16 << 20; // 16 MiB
+        let src = vec![0x5au8; BUF_LEN];
+        let mut dst = vec![0u8; BUF_LEN];
+        let mut cmp_ref = vec![0x5au8; BUF_LEN];
+
+        if let Some((_shared, shared_ptr)) = host.shared_buffer(BUF_LEN as u64) {
+            crate::host::copy_mapped(shared_ptr, src.as_ptr(), BUF_LEN, false);
+            let t0 = Instant::now();
+            for _ in 0..8 {
+                crate::host::copy_mapped(shared_ptr, src.as_ptr(), BUF_LEN, false);
+            }
+            let shared_write = t0.elapsed();
+            let t0 = Instant::now();
+            for _ in 0..8 {
+                // SAFETY: mapped 16 MiB shared buffer.
+                unsafe { std::ptr::copy_nonoverlapping(shared_ptr, dst.as_mut_ptr(), BUF_LEN) };
+                black_box(dst[0]);
+            }
+            let shared_read = t0.elapsed();
+            println!(
+                "[BENCH] shared_buffer 128MiB: write={shared_write:?} ({:.2} GB/s), read={shared_read:?} ({:.2} GB/s)",
+                (8 * BUF_LEN) as f64 / shared_write.as_secs_f64() / 1e9,
+                (8 * BUF_LEN) as f64 / shared_read.as_secs_f64() / 1e9,
+            );
+        }
+
+        if crate::rebar::supported()
+            && let Some((_rebar, rebar_ptr)) = host.gpu_upload_buffer(BUF_LEN as u64)
+        {
+            // Write via copy_mapped (NtReadVirtualMemory directly to WC)
+            crate::host::copy_mapped(rebar_ptr, src.as_ptr(), BUF_LEN, false);
+            let t0 = Instant::now();
+            for _ in 0..8 {
+                crate::host::copy_mapped(rebar_ptr, src.as_ptr(), BUF_LEN, false);
+            }
+            let rebar_write_nt = t0.elapsed();
+
+            // Write via direct copy_nonoverlapping to WC
+            let t0 = Instant::now();
+            for _ in 0..8 {
+                // SAFETY: mapped 16 MiB ReBAR buffer.
+                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), rebar_ptr, BUF_LEN) };
+            }
+            let rebar_write_memcpy = t0.elapsed();
+
+            // Read BEFORE: normal copy_nonoverlapping from WC (uncached loads)
+            let t0 = Instant::now();
+            // SAFETY: mapped 16 MiB ReBAR buffer.
+            unsafe { std::ptr::copy_nonoverlapping(rebar_ptr, dst.as_mut_ptr(), BUF_LEN) };
+            black_box(dst[0]);
+            let rebar_read_before = t0.elapsed();
+
+            // Read AFTER: 4-cache-line unrolled AVX2 VMOVNTDQA streaming loads
+            let t0 = Instant::now();
+            // SAFETY: mapped 16 MiB ReBAR buffer.
+            unsafe { copy_from_wc(rebar_ptr, dst.as_mut_ptr(), BUF_LEN) };
+            black_box(dst[0]);
+            let rebar_read_after = t0.elapsed();
+            assert_eq!(dst[0], 0x5a);
+
+            // Read AFTER (wide multi-threaded VMOVNTDQA via copy_wide)
+            let t0 = Instant::now();
+            // SAFETY: mapped 16 MiB ReBAR buffer.
+            unsafe { super::copy_wide(rebar_ptr, dst.as_mut_ptr(), BUF_LEN, true) };
+            black_box(dst[0]);
+            let rebar_read_wide = t0.elapsed();
+
+            // Compare BEFORE (`slice == slice`) vs AFTER (branchless-per-4KiB `slices_equal_wc`)
+            cmp_ref.fill(0x5a);
+            let t0 = Instant::now();
+            // SAFETY: mapped 16 MiB ReBAR buffer.
+            let eq_before = black_box(unsafe { std::slice::from_raw_parts(rebar_ptr, BUF_LEN) } == &cmp_ref[..]);
+            let rebar_cmp_before = t0.elapsed();
+            assert!(eq_before);
+
+            let t0 = Instant::now();
+            // SAFETY: mapped 16 MiB ReBAR buffer.
+            let eq_after = black_box(unsafe { slices_equal_wc(rebar_ptr, cmp_ref.as_ptr(), BUF_LEN) });
+            let rebar_cmp_after = t0.elapsed();
+            assert!(eq_after);
+
+            // Compare AFTER (wide multi-threaded `find_pieces_wc`)
+            let t0 = Instant::now();
+            let pieces_after = super::find_pieces_wc(vec![(
+                rebar_ptr as usize,
+                cmp_ref.as_ptr() as usize,
+                0,
+                0,
+                BUF_LEN,
+                true,
+            )]);
+            let rebar_cmp_wide = t0.elapsed();
+            assert!(pieces_after[0].is_empty());
+
+            // Simulate ReBAR copy-back of 16 x 64 KiB (1 MiB) differing pieces:
+            // BEFORE (direct WC first_diff + last_diff + byte merge loop on WC) vs
+            // AFTER (single VMOVNTDQA read into L1 + L1 diff/merge + changed_runs storeback)
+            const CB_PIECES: usize = 16;
+            let mut old_1m = vec![0x5au8; CB_PIECES * PIECE];
+            let mut title_1m = old_1m.clone();
+            for p in 0..CB_PIECES {
+                old_1m[p * PIECE + 64] ^= 0x11;
+                old_1m[p * PIECE + PIECE - 65] ^= 0x22;
+            }
+            let t0 = Instant::now();
+            for p in 0..CB_PIECES {
+                let off = p * PIECE;
+                // SAFETY: mapped 16 MiB ReBAR buffer.
+                let host_s = unsafe { std::slice::from_raw_parts_mut(rebar_ptr.add(off), PIECE) };
+                let old_s = &old_1m[off..off + PIECE];
+                let first = first_difference_scalar(host_s, old_s).unwrap();
+                let last = last_difference_scalar(host_s, old_s).unwrap();
+                let _ = baseline_sync(
+                    &mut title_1m[off + first..=off + last],
+                    &mut host_s[first..=last],
+                    &old_s[first..=last],
+                );
+            }
+            let rebar_cb_before = t0.elapsed();
+
+            // Reset title_1m and rebar bytes cleanly
+            title_1m.copy_from_slice(&old_1m);
+            // SAFETY: mapped 16 MiB ReBAR buffer.
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), rebar_ptr, CB_PIECES * PIECE) };
+            let mut wc_scratch = vec![0u8; PIECE];
+            let t0 = Instant::now();
+            for p in 0..CB_PIECES {
+                let off = p * PIECE;
+                // SAFETY: mapped 16 MiB ReBAR buffer.
+                unsafe { copy_from_wc(rebar_ptr.add(off), wc_scratch.as_mut_ptr(), PIECE) };
+                let old_s = &old_1m[off..off + PIECE];
+                let first = first_difference(&wc_scratch, old_s).unwrap();
+                let last = last_difference(&wc_scratch, old_s).unwrap();
+                let host_orig = &wc_scratch[first..=last];
+                let t_slice = &mut title_1m[off + first..=off + last];
+                let _ = super::merge_gpu_into_title(t_slice, host_orig, &old_s[first..=last]);
+                for (run_at, run_len) in changed_runs(t_slice, host_orig) {
+                    // SAFETY: sequential WC write of changed run only.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            t_slice.as_ptr().add(run_at),
+                            rebar_ptr.add(off + first + run_at),
+                            run_len,
+                        );
+                    }
+                }
+            }
+            let rebar_cb_after = t0.elapsed();
+
+            println!(
+                "[BENCH] ReBAR GPU_UPLOAD write 128MiB: copy_mapped={rebar_write_nt:?} ({:.2} GB/s), memcpy={rebar_write_memcpy:?} ({:.2} GB/s)",
+                (8 * BUF_LEN) as f64 / rebar_write_nt.as_secs_f64() / 1e9,
+                (8 * BUF_LEN) as f64 / rebar_write_memcpy.as_secs_f64() / 1e9,
+            );
+            println!(
+                "[BENCH] ReBAR GPU_UPLOAD read 16MiB: before(memcpy)={rebar_read_before:?} ({:.3} GB/s), after(VMOVNTDQA 1T)={rebar_read_after:?} ({:.3} GB/s, {:.1}x), wide(MT)={rebar_read_wide:?} ({:.3} GB/s, {:.1}x)",
+                BUF_LEN as f64 / rebar_read_before.as_secs_f64() / 1e9,
+                BUF_LEN as f64 / rebar_read_after.as_secs_f64() / 1e9,
+                rebar_read_before.as_secs_f64() / rebar_read_after.as_secs_f64(),
+                BUF_LEN as f64 / rebar_read_wide.as_secs_f64() / 1e9,
+                rebar_read_before.as_secs_f64() / rebar_read_wide.as_secs_f64(),
+            );
+            println!(
+                "[BENCH] ReBAR GPU_UPLOAD cmp 16MiB: before(slice==)={rebar_cmp_before:?} ({:.3} GB/s), after(slices_equal_wc 1T)={rebar_cmp_after:?} ({:.3} GB/s, {:.1}x), wide(MT)={rebar_cmp_wide:?} ({:.3} GB/s, {:.1}x)",
+                BUF_LEN as f64 / rebar_cmp_before.as_secs_f64() / 1e9,
+                BUF_LEN as f64 / rebar_cmp_after.as_secs_f64() / 1e9,
+                rebar_cmp_before.as_secs_f64() / rebar_cmp_after.as_secs_f64(),
+                BUF_LEN as f64 / rebar_cmp_wide.as_secs_f64() / 1e9,
+                rebar_cmp_before.as_secs_f64() / rebar_cmp_wide.as_secs_f64(),
+            );
+            println!(
+                "[BENCH] ReBAR GPU_UPLOAD copy_back 1MiB (16x64KiB): before(direct WC)={rebar_cb_before:?}, after(VMOVNTDQA+L1)={rebar_cb_after:?} ({:.1}x)",
+                rebar_cb_before.as_secs_f64() / rebar_cb_after.as_secs_f64(),
+            );
+        } else {
+            println!("[BENCH] ReBAR GPU_UPLOAD not supported on this adapter");
+        }
     }
 }
 

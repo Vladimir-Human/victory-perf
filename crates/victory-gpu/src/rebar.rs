@@ -77,8 +77,31 @@ pub(crate) struct Ask {
     pub card: Option<(u64, u64)>,
 }
 
+/// Computes `budget * percent / 100` without intermediate truncation or u64 overflow.
+fn card_limit_bytes(budget: u64, percent: u64) -> u64 {
+    ((u128::from(budget) * u128::from(percent)) / 100) as u64
+}
+
+/// Maximum share of VRAM budget (%) up to which ReBAR copies may be placed
+/// (`VICTORY_REBAR_VRAM_PERCENT`, default 80 — leaving a fifth of the card
+/// free; clamped 50..=90).
+fn vram_percent() -> u64 {
+    static PERCENT: OnceLock<u64> = OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_REBAR_VRAM_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(80, |p| p.clamp(50, 90))
+    })
+}
+
 /// The placement rule (pure: tested below).
+#[cfg(test)]
 pub(crate) fn decide(ask: &Ask) -> Decision {
+    decide_with_percent(ask, 80)
+}
+
+fn decide_with_percent(ask: &Ask, vram_pct: u64) -> Decision {
     if ask.level == 0 {
         return Decision::Off;
     }
@@ -97,7 +120,7 @@ pub(crate) fn decide(ask: &Ask) -> Decision {
         return Decision::OverBudget;
     }
     if let Some((budget, used)) = ask.card
-        && used.saturating_add(ask.size) > budget / 10 * 8
+        && used.saturating_add(ask.size) > card_limit_bytes(budget, vram_pct)
     {
         return Decision::CardFull;
     }
@@ -130,6 +153,8 @@ pub(crate) fn level() -> u8 {
 /// Whether the host's device has GPU upload heaps: set once at the host's
 /// start ([`probe`]).
 static SUPPORTED: OnceLock<bool> = OnceLock::new();
+/// Local video memory budget captured at startup by [`probe`].
+static PROBED_BUDGET: OnceLock<Option<u64>> = OnceLock::new();
 
 pub(crate) fn supported() -> bool {
     SUPPORTED.get().copied().unwrap_or(false)
@@ -138,10 +163,19 @@ pub(crate) fn supported() -> bool {
 fn most() -> u64 {
     static MOST: OnceLock<u64> = OnceLock::new();
     *MOST.get_or_init(|| {
-        let env = std::env::var("VICTORY_REBAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let env = std::env::var("VICTORY_REBAR_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
         match env {
-            Some(mb) => mb << 20,
-            None => default_most(crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b)),
+            Some(mb) => mb.saturating_mul(1 << 20),
+            None => {
+                let budget = PROBED_BUDGET
+                    .get()
+                    .copied()
+                    .flatten()
+                    .or_else(|| crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b));
+                default_most(budget)
+            }
         }
     })
 }
@@ -149,18 +183,94 @@ fn most() -> u64 {
 /// Bytes placed alive, copies placed alive, and copies that wanted to be
 /// placed but were not (over the budget, card full, creation failed).
 static PLACED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Bytes reserved by [`reserve`] whose D3D12 resource creation has not yet
+/// completed (and therefore may not yet appear in DXGI `CurrentUsage`).
+static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 /// The next multiple of 64 MiB of placed bytes at which a line is written.
 static NEXT_LINE: AtomicU64 = AtomicU64::new(64 << 20);
 
 /// Reserves bytes against the current count, so concurrent callers cannot
 /// both spend the same remaining budget. Returns the new total.
 fn reserve_bytes(placed: &AtomicU64, size: u64, most: u64) -> Option<u64> {
+    if size == 0 {
+        return None;
+    }
     placed
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
             used.checked_add(size).filter(|&next| next <= most)
         })
         .ok()
         .map(|before| before + size)
+}
+
+/// Atomically reserves `size` bytes against `placed`, bounded simultaneously by
+/// `most` and the card's remaining VRAM headroom (accounting for `in_flight`
+/// bytes whose D3D12 allocations have not yet updated DXGI `CurrentUsage`).
+fn reserve_with_card(
+    placed: &AtomicU64,
+    in_flight: &AtomicU64,
+    size: u64,
+    most: u64,
+    card: Option<(u64, u64)>,
+    vram_pct: u64,
+) -> Option<u64> {
+    if size == 0 {
+        return None;
+    }
+    // Step 1: when card VRAM headroom is known, atomically claim it in
+    // `in_flight` BEFORE claiming `placed`, so concurrent callers racing
+    // against a tight VRAM wall cannot observe the same stale headroom or slip
+    // between `placed` and `in_flight`.
+    let Some((budget, used)) = card else {
+        let next = reserve_bytes(placed, size, most)?;
+        in_flight.fetch_add(size, Ordering::Release);
+        return Some(next);
+    };
+    let limit = card_limit_bytes(budget, vram_pct);
+    in_flight
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            let effective_used = used.checked_add(cur)?;
+            let next_used = effective_used.checked_add(size)?;
+            (next_used <= limit).then(|| cur + size)
+        })
+        .ok()?;
+    // Step 2: atomically claim ReBAR byte budget in `placed`, rolling back
+    // `in_flight` on failure.
+    match reserve_bytes(placed, size, most) {
+        Some(next) => Some(next),
+        None => {
+            in_flight.fetch_sub(size, Ordering::Release);
+            None
+        }
+    }
+}
+
+/// RAII token returned by [`reserve`]. Calling [`Reservation::commit`] hands
+/// ownership of the byte count to the live `Shadow` (which returns it via
+/// [`released`] on drop); dropping without committing rolls back both the
+/// placed counters and the in-flight headroom counter.
+pub(crate) struct Reservation {
+    size: u64,
+    committed: bool,
+}
+
+impl Reservation {
+    /// Marks the D3D12 resource creation complete and returns the reserved byte
+    /// count to store on the `Shadow`.
+    pub(crate) fn commit(mut self) -> u64 {
+        self.committed = true;
+        IN_FLIGHT.fetch_sub(self.size, Ordering::Release);
+        self.size
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            IN_FLIGHT.fetch_sub(self.size, Ordering::Release);
+            released(self.size);
+        }
+    }
 }
 
 /// At the host's start: whether the device has GPU upload heaps, and the
@@ -174,6 +284,7 @@ pub(crate) fn probe(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
     };
     let supported = asked.is_ok() && o16.GPUUploadHeapSupported.as_bool();
     let _ = SUPPORTED.set(supported);
+    let _ = PROBED_BUDGET.set(card_budget);
     let level = level();
     let most_mb = match std::env::var("VICTORY_REBAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
         Some(mb) => mb,
@@ -185,6 +296,7 @@ pub(crate) fn probe(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
         card_budget_mb = card_budget.map(|b| b >> 20),
         level,
         most_mb,
+        vram_percent = vram_percent(),
         "Resizable BAR (D3D12 GPU upload heaps): {}",
         match (supported, level) {
             (true, 0) => "available, not used (VICTORY_REBAR=1 or 2 places host copies there)",
@@ -197,48 +309,79 @@ pub(crate) fn probe(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
     );
 }
 
+fn note_refused(kind: Kind, size: u64) {
+    if PLACED[2].fetch_add(1, Ordering::Relaxed) == 0 {
+        tracing::warn!(
+            ?kind,
+            size,
+            "Resizable BAR: a copy stays in the PC's memory (budget or card full)"
+        );
+    }
+}
+
 /// Whether a copy of `size` bytes of `kind` goes to the card's mapped
-/// memory; if it does, its bytes are counted as placed (the caller gives
-/// them back with [`released`] if the buffer cannot be made, or when it
-/// goes).
-pub(crate) fn reserve(kind: Kind, size: u64, cpu_read: bool) -> bool {
+/// memory; if it does, returns a [`Reservation`] counting its bytes as placed
+/// (call [`Reservation::commit`] once the buffer is created, or drop it to
+/// roll back automatically).
+pub(crate) fn reserve(kind: Kind, size: u64, cpu_read: bool) -> Option<Reservation> {
     let level = level();
-    if level == 0 || !supported() {
-        return false;
+    if size == 0 || level == 0 || !supported() || cpu_read {
+        return None;
+    }
+    if matches!(kind, Kind::Buffer) && level < 2 {
+        return None;
+    }
+    let most = most();
+    let placed = PLACED[0].load(Ordering::Relaxed);
+    // Avoid DXGI `QueryVideoMemoryInfo` syscalls once the ReBAR byte cap is full.
+    if placed.saturating_add(size) > most {
+        note_refused(kind, size);
+        return None;
     }
     let host = crate::host::host();
     let card = host.and_then(|h| h.video_memory()).map(|[b, u, ..]| (b, u));
+    let vram_pct = vram_percent();
     let ask = Ask {
         level,
         supported: true,
         kind,
         size,
         cpu_read,
-        placed: PLACED[0].load(Ordering::Relaxed),
-        most: most(),
-        card,
+        placed,
+        most,
+        card: card.map(|(b, u)| (b, u.saturating_add(IN_FLIGHT.load(Ordering::Acquire)))),
     };
-    let reserved = match decide(&ask) {
-        Decision::Rebar => reserve_bytes(&PLACED[0], size, ask.most),
+    let reserved = match decide_with_percent(&ask, vram_pct) {
+        Decision::Rebar => reserve_with_card(&PLACED[0], &IN_FLIGHT, size, most, card, vram_pct),
         Decision::OverBudget | Decision::CardFull => None,
-        _ => return false,
+        _ => return None,
     };
     let Some(now) = reserved else {
-        if PLACED[2].fetch_add(1, Ordering::Relaxed) == 0 {
-            tracing::warn!(?kind, size, "Resizable BAR: a copy stays in the PC's memory (budget or card full)");
-        }
-        return false;
+        note_refused(kind, size);
+        return None;
     };
     PLACED[1].fetch_add(1, Ordering::Relaxed);
     let line = NEXT_LINE.load(Ordering::Relaxed);
-    if now >= line && NEXT_LINE.compare_exchange(line, now / (64 << 20) * (64 << 20) + (64 << 20), Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+    if now >= line
+        && NEXT_LINE
+            .compare_exchange(
+                line,
+                now / (64 << 20) * (64 << 20) + (64 << 20),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    {
         tracing::info!(
             placed_mb = now >> 20,
             copies = PLACED[1].load(Ordering::Relaxed),
             "Resizable BAR: host copies placed in the card's mapped memory"
         );
     }
-    true
+    Some(Reservation {
+        size,
+        committed: false,
+    })
 }
 
 /// Gives back what [`reserve`] counted.
@@ -371,5 +514,99 @@ mod tests {
         assert_eq!(default_most(None), 256 * MIB);
         assert_eq!(default_most(Some(11 * GIB)), 11 * GIB / 4);
         assert_eq!(default_most(Some(30 * GIB)), 4 * GIB);
+    }
+
+    #[test]
+    fn zero_size_reservation_is_refused() {
+        let placed = AtomicU64::new(0);
+        let in_flight = AtomicU64::new(0);
+        assert_eq!(reserve_bytes(&placed, 0, GIB), None);
+        assert_eq!(
+            reserve_with_card(&placed, &in_flight, 0, GIB, Some((10 * GIB, 0)), 80),
+            None
+        );
+        assert_eq!(placed.load(Ordering::Relaxed), 0);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn concurrent_reservations_respect_card_headroom_wall() {
+        // ReBAR budget has plenty of room (2 GiB), but VRAM only has 4 MiB left
+        // before the 80% wall on a 12 GiB card. Exactly one of 8 concurrent
+        // 4 MiB callers may succeed.
+        let placed = AtomicU64::new(512 * MIB);
+        let in_flight = AtomicU64::new(0);
+        let budget = 12 * GIB;
+        let used = card_limit_bytes(budget, 80) - 4 * MIB;
+        let gate = std::sync::Barrier::new(8);
+        let accepted = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        gate.wait();
+                        reserve_with_card(
+                            &placed,
+                            &in_flight,
+                            4 * MIB,
+                            2 * GIB,
+                            Some((budget, used)),
+                            80,
+                        )
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .filter_map(|w| w.join().unwrap())
+                .count()
+        });
+        assert_eq!(accepted, 1);
+        assert_eq!(placed.load(Ordering::Relaxed), 516 * MIB);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 4 * MIB);
+    }
+
+    #[test]
+    fn in_flight_reservation_blocks_overshoot_before_dxgi_updates() {
+        let placed = AtomicU64::new(0);
+        let in_flight = AtomicU64::new(0);
+        let budget = 11 * GIB;
+        let limit = card_limit_bytes(budget, 80);
+        let used = limit - 4 * MIB;
+
+        // First 4 MiB fits and increments in_flight while CreateCommittedResource runs.
+        assert_eq!(
+            reserve_with_card(&placed, &in_flight, 4 * MIB, 2 * GIB, Some((budget, used)), 80),
+            Some(4 * MIB)
+        );
+        // Second caller sees stale DXGI `used` before first resource completes: blocked by in_flight!
+        assert_eq!(
+            reserve_with_card(&placed, &in_flight, 4 * MIB, 2 * GIB, Some((budget, used)), 80),
+            None
+        );
+        // Once the first allocation commits (or fails and rolls back), in_flight drops.
+        in_flight.fetch_sub(4 * MIB, Ordering::Release);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+        // With fresh DXGI usage reflecting `limit`, still blocked.
+        assert_eq!(
+            reserve_with_card(&placed, &in_flight, 4 * MIB, 2 * GIB, Some((budget, limit)), 80),
+            None
+        );
+        // After other VRAM is freed, a new 4 MiB allocation succeeds again.
+        assert_eq!(
+            reserve_with_card(&placed, &in_flight, 4 * MIB, 2 * GIB, Some((budget, limit - 4 * MIB)), 80),
+            Some(8 * MIB)
+        );
+    }
+
+    #[test]
+    fn card_limit_bytes_is_exact_without_truncation() {
+        assert_eq!(card_limit_bytes(10 * GIB, 80), 8 * GIB);
+        // `105 / 10 * 8 = 80`, whereas exact `105 * 80 / 100 = 84`.
+        assert_eq!(card_limit_bytes(105, 80), 84);
+        assert_eq!(
+            card_limit_bytes(12 * GIB, 80),
+            ((u128::from(12 * GIB) * 80) / 100) as u64
+        );
+        assert_eq!(card_limit_bytes(u64::MAX, 80), (u128::from(u64::MAX) * 80 / 100) as u64);
     }
 }
