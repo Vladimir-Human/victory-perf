@@ -193,10 +193,11 @@ enum PtrRoot {
     Unknown,
 }
 
-/// Constant vs dynamic GEP index path from a [`PtrRoot`].
+/// Constant canonical scalar-leaf vs dynamic GEP path from a [`PtrRoot`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum PtrPath {
-    Const(Vec<u64>),
+    /// Canonical in-bounds root-to-scalar-leaf path with its exact leaf type.
+    Const(Ty, Vec<u64>),
     Dynamic,
 }
 
@@ -245,7 +246,7 @@ fn write_kind(f: &Func) -> WriteKind {
 /// Tracked values of non-escaping thread-private globals (`space == 0`).
 #[derive(Default, Clone)]
 struct PrivateVals {
-    const_vals: HashMap<(u32, Ty, Vec<u64>), V>,
+    const_vals: HashMap<(u32, Vec<u64>), V>,
     dyn_vals: HashMap<(u32, V, Ty), V>,
 }
 
@@ -1190,57 +1191,94 @@ impl Module {
         }
     }
 
-    /// Traces pointer `v` through GEP chains to its root global and constant
-    /// (or dynamic) index path.
+    /// Whether `ty` is an indivisible scalar leaf (never a struct/array aggregate).
+    fn is_scalar_ty(&self, ty: Ty) -> bool {
+        matches!(
+            self.types[ty.0 as usize],
+            TypeDef::Int(_) | TypeDef::Float | TypeDef::Double | TypeDef::Ptr(..)
+        )
+    }
+
+    /// Traces pointer `v` through arbitrarily deep GEP chains to its root
+    /// global and canonical, provably in-bounds, non-overlapping scalar-leaf
+    /// path (or [`PtrPath::Dynamic`] for any dynamic, out-of-bounds, negative,
+    /// aggregate, or non-canonical pointer).
     fn trace_ptr(&self, mut v: V, escaped: &[bool]) -> (PtrRoot, PtrPath) {
         let mut hops: Vec<(Ty, Ty, Vec<V>)> = Vec::new();
-        for _ in 0..32 {
+        for _ in 0..=self.insts.len() {
             match v {
                 V::Global(g) => {
-                    let root = if self.globals[g as usize].init.is_some() {
+                    let global = &self.globals[g as usize];
+                    let root = if global.init.is_some() {
                         PtrRoot::ConstGlobal(g)
                     } else if escaped.get(g as usize).copied().unwrap_or(true) {
                         PtrRoot::Unknown
-                    } else if self.globals[g as usize].space == 0 {
+                    } else if global.space == 0 {
                         PtrRoot::PrivateGlobal(g)
-                    } else if self.globals[g as usize].space == 3 {
+                    } else if global.space == 3 {
                         PtrRoot::SharedGlobal(g)
                     } else {
                         PtrRoot::Unknown
                     };
-                    if hops.is_empty() {
-                        return (root, PtrPath::Const(Vec::new()));
-                    }
+                    let mut cur_ty = global.ty;
+                    let g_space = global.space;
                     let mut path: Vec<u64> = Vec::new();
-                    let mut prev_pointee: Option<Ty> = None;
+                    let mut parent_array_len: Option<u32> = None;
                     for (gep_ty, res_ty, idx) in hops.into_iter().rev() {
+                        if gep_ty != cur_ty || idx.is_empty() {
+                            return (root, PtrPath::Dynamic);
+                        }
                         let mut consts = Vec::with_capacity(idx.len());
                         for ix in idx {
-                            let Some((_, k)) = self.int_k(ix) else {
+                            let Some((bits, k)) = self.int_k(ix) else {
                                 return (root, PtrPath::Dynamic);
                             };
-                            consts.push(k);
-                        }
-                        if prev_pointee.is_none() {
-                            path.extend(consts);
-                        } else if !consts.is_empty() {
-                            if consts[0] == 0 {
-                                path.extend_from_slice(&consts[1..]);
-                            } else if prev_pointee == Some(gep_ty)
-                                && let Some(last) = path.last_mut()
-                            {
-                                *last = last.wrapping_add(consts[0]);
-                                path.extend_from_slice(&consts[1..]);
-                            } else {
+                            if bits == 0 {
                                 return (root, PtrPath::Dynamic);
                             }
+                            consts.push(signed(bits, k));
                         }
-                        prev_pointee = match self.types[res_ty.0 as usize] {
-                            TypeDef::Ptr(pt, _) => Some(pt),
-                            _ => None,
-                        };
+                        let s0 = consts[0];
+                        if s0 != 0 {
+                            let (Some(len), Some(last)) = (parent_array_len, path.last_mut())
+                            else {
+                                return (root, PtrPath::Dynamic);
+                            };
+                            let next = i128::from(*last) + i128::from(s0);
+                            if next < 0 || next >= i128::from(len) {
+                                return (root, PtrPath::Dynamic);
+                            }
+                            *last = next as u64;
+                        }
+                        for &s in &consts[1..] {
+                            if s < 0 {
+                                return (root, PtrPath::Dynamic);
+                            }
+                            match &self.types[cur_ty.0 as usize] {
+                                TypeDef::Array(len, elem) if (s as u64) < u64::from(*len) => {
+                                    path.push(s as u64);
+                                    parent_array_len = Some(*len);
+                                    cur_ty = *elem;
+                                }
+                                TypeDef::Struct(_, fields) if (s as u64) < fields.len() as u64 => {
+                                    path.push(s as u64);
+                                    parent_array_len = None;
+                                    cur_ty = fields[s as usize];
+                                }
+                                _ => return (root, PtrPath::Dynamic),
+                            }
+                        }
+                        if !matches!(
+                            self.types[res_ty.0 as usize],
+                            TypeDef::Ptr(pt, sp) if pt == cur_ty && sp == g_space
+                        ) {
+                            return (root, PtrPath::Dynamic);
+                        }
                     }
-                    return (root, PtrPath::Const(path));
+                    if !self.is_scalar_ty(cur_ty) {
+                        return (root, PtrPath::Dynamic);
+                    }
+                    return (root, PtrPath::Const(cur_ty, path));
                 }
                 V::Inst(id) => {
                     let inst = &self.insts[id as usize];
@@ -1307,27 +1345,14 @@ impl Module {
         escaped
     }
 
-    /// Whether `p` is a constant in-bounds pointer into an immutable constant
-    /// global array (safe to load speculatively during LICM).
-    fn is_in_bounds_const_global_ptr(&self, p: V) -> bool {
-        match p {
-            V::Global(g) => self.globals[g as usize].init.is_some(),
-            V::Inst(id) => {
-                let Op::Gep(arr_ty, V::Global(g), idx) = &self.insts[id as usize].op else {
-                    return false;
-                };
-                if self.globals[*g as usize].init.is_none() {
-                    return false;
-                }
-                let TypeDef::Array(len, _) = self.types[arr_ty.0 as usize] else {
-                    return false;
-                };
-                idx.len() == 2
-                    && self.int_k(idx[0]).is_some_and(|(_, k)| k == 0)
-                    && self.int_k(idx[1]).is_some_and(|(_, k)| k < u64::from(len))
-            }
-            _ => false,
-        }
+    /// Whether `p` is a provably in-bounds constant pointer to a scalar of
+    /// type `val_ty` inside an immutable constant global (safe to load
+    /// speculatively during LICM).
+    fn is_in_bounds_const_global_ptr(&self, p: V, val_ty: Ty) -> bool {
+        matches!(
+            self.trace_ptr(p, &[]),
+            (PtrRoot::ConstGlobal(_), PtrPath::Const(leaf_ty, _)) if leaf_ty == val_ty
+        )
     }
 
     /// What kind of instruction `i` is for merging.
@@ -1343,7 +1368,7 @@ impl Module {
                 // A constant table reads the same whatever is stored (walk
                 // arbitrarily deep GEP chains).
                 let mut cur = *p;
-                for _ in 0..32 {
+                for _ in 0..=self.insts.len() {
                     match cur {
                         V::Global(g) if self.globals[g as usize].init.is_some() => {
                             return Effect::Pure;
@@ -1448,12 +1473,12 @@ impl Module {
         // Per-block wave/quad lane ops (`Effect::Lanes`).
         let mut read_lanes: HashMap<Key, V> = HashMap::new();
         // Per-block shared memory (LDS, space 3) tracked values.
-        let mut shared_const: HashMap<(u32, Ty, Vec<u64>), V> = HashMap::new();
+        let mut shared_const: HashMap<(u32, Vec<u64>), V> = HashMap::new();
         let mut shared_dyn: HashMap<(u32, V, Ty), V> = HashMap::new();
         // Per-block escaped/unknown pointer loads.
         let mut unknown_loads: HashMap<V, V> = HashMap::new();
         // Per-block un-observed local/shared stores eligible for overwritten DSE.
-        let mut pending_const_stores: HashMap<(u32, Ty, Vec<u64>), usize> = HashMap::new();
+        let mut pending_const_stores: HashMap<(u32, Vec<u64>), usize> = HashMap::new();
         let mut pending_dyn_stores: HashMap<(u32, V, Ty), usize> = HashMap::new();
         // Exit state of non-escaping thread-private globals for single-pred children.
         let mut exit_private: Vec<Option<PrivateVals>> = vec![None; self.blocks.len()];
@@ -1601,12 +1626,18 @@ impl Module {
                     Op::Load(ptr) if class != Effect::Pure => {
                         if passes & LOADS != 0 {
                             let val_ty = self.insts[i as usize].ty;
-                            let (root, path) = self.trace_ptr(ptr, &escaped);
+                            let (root, raw_path) = self.trace_ptr(ptr, &escaped);
+                            let path = match raw_path {
+                                PtrPath::Const(leaf_ty, cp) if leaf_ty == val_ty => {
+                                    PtrPath::Const(leaf_ty, cp)
+                                }
+                                _ => PtrPath::Dynamic,
+                            };
                             match root {
                                 PtrRoot::PrivateGlobal(g) => {
                                     let hit = match &path {
-                                        PtrPath::Const(cp) => {
-                                            priv_vals.const_vals.get(&(g, val_ty, cp.clone())).copied()
+                                        PtrPath::Const(_, cp) => {
+                                            priv_vals.const_vals.get(&(g, cp.clone())).copied()
                                         }
                                         PtrPath::Dynamic => {
                                             priv_vals.dyn_vals.get(&(g, ptr, val_ty)).copied()
@@ -1618,16 +1649,14 @@ impl Module {
                                         continue;
                                     }
                                     match path {
-                                        PtrPath::Const(cp) => {
+                                        PtrPath::Const(_, cp) => {
                                             pending_const_stores
-                                                .retain(|(pg, _, pp), _| !(*pg == g && *pp == cp));
+                                                .retain(|(pg, pp), _| !(*pg == g && *pp == cp));
                                             pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
-                                            priv_vals
-                                                .const_vals
-                                                .insert((g, val_ty, cp), V::Inst(i));
+                                            priv_vals.const_vals.insert((g, cp), V::Inst(i));
                                         }
                                         PtrPath::Dynamic => {
-                                            pending_const_stores.retain(|(pg, _, _), _| *pg != g);
+                                            pending_const_stores.retain(|(pg, _), _| *pg != g);
                                             pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
                                             priv_vals
                                                 .dyn_vals
@@ -1637,8 +1666,8 @@ impl Module {
                                 }
                                 PtrRoot::SharedGlobal(g) => {
                                     let hit = match &path {
-                                        PtrPath::Const(cp) => {
-                                            shared_const.get(&(g, val_ty, cp.clone())).copied()
+                                        PtrPath::Const(_, cp) => {
+                                            shared_const.get(&(g, cp.clone())).copied()
                                         }
                                         PtrPath::Dynamic => {
                                             shared_dyn.get(&(g, ptr, val_ty)).copied()
@@ -1650,14 +1679,14 @@ impl Module {
                                         continue;
                                     }
                                     match path {
-                                        PtrPath::Const(cp) => {
+                                        PtrPath::Const(_, cp) => {
                                             pending_const_stores
-                                                .retain(|(pg, _, pp), _| !(*pg == g && *pp == cp));
+                                                .retain(|(pg, pp), _| !(*pg == g && *pp == cp));
                                             pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
-                                            shared_const.insert((g, val_ty, cp), V::Inst(i));
+                                            shared_const.insert((g, cp), V::Inst(i));
                                         }
                                         PtrPath::Dynamic => {
-                                            pending_const_stores.retain(|(pg, _, _), _| *pg != g);
+                                            pending_const_stores.retain(|(pg, _), _| *pg != g);
                                             pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
                                             shared_dyn.insert((g, ptr, val_ty), V::Inst(i));
                                         }
@@ -1680,11 +1709,17 @@ impl Module {
                     Op::Store(ptr, val) => {
                         if passes & LOADS != 0 {
                             let val_ty = self.type_of(val);
-                            let (root, path) = self.trace_ptr(ptr, &escaped);
+                            let (root, raw_path) = self.trace_ptr(ptr, &escaped);
+                            let path = match raw_path {
+                                PtrPath::Const(leaf_ty, cp) if leaf_ty == val_ty => {
+                                    PtrPath::Const(leaf_ty, cp)
+                                }
+                                _ => PtrPath::Dynamic,
+                            };
                             match root {
                                 PtrRoot::PrivateGlobal(g) => match path {
-                                    PtrPath::Const(cp) => {
-                                        let slot = (g, val_ty, cp);
+                                    PtrPath::Const(_, cp) => {
+                                        let slot = (g, cp);
                                         if priv_vals.const_vals.get(&slot) == Some(&val) {
                                             changed = true;
                                             continue;
@@ -1714,9 +1749,9 @@ impl Module {
                                             dropped_store = true;
                                             changed = true;
                                         }
-                                        pending_const_stores.retain(|(pg, _, _), _| *pg != g);
+                                        pending_const_stores.retain(|(pg, _), _| *pg != g);
                                         pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
-                                        priv_vals.const_vals.retain(|(pg, _, _), _| *pg != g);
+                                        priv_vals.const_vals.retain(|(pg, _), _| *pg != g);
                                         priv_vals.dyn_vals.retain(|(pg, _, _), _| *pg != g);
                                         priv_vals.dyn_vals.insert(slot, val);
                                         let pos = kept.len();
@@ -1727,8 +1762,8 @@ impl Module {
                                     }
                                 },
                                 PtrRoot::SharedGlobal(g) => match path {
-                                    PtrPath::Const(cp) => {
-                                        let slot = (g, val_ty, cp);
+                                    PtrPath::Const(_, cp) => {
+                                        let slot = (g, cp);
                                         if let Some(prev) = pending_const_stores.remove(&slot) {
                                             kept[prev] = u32::MAX;
                                             dropped_store = true;
@@ -1750,9 +1785,9 @@ impl Module {
                                             dropped_store = true;
                                             changed = true;
                                         }
-                                        pending_const_stores.retain(|(pg, _, _), _| *pg != g);
+                                        pending_const_stores.retain(|(pg, _), _| *pg != g);
                                         pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
-                                        shared_const.retain(|(pg, _, _), _| *pg != g);
+                                        shared_const.retain(|(pg, _), _| *pg != g);
                                         shared_dyn.retain(|(pg, _, _), _| *pg != g);
                                         shared_dyn.insert(slot, val);
                                         let pos = kept.len();
@@ -1773,15 +1808,15 @@ impl Module {
                             let (root, _) = self.trace_ptr(ptr, &escaped);
                             match root {
                                 PtrRoot::PrivateGlobal(g) => {
-                                    priv_vals.const_vals.retain(|(pg, _, _), _| *pg != g);
+                                    priv_vals.const_vals.retain(|(pg, _), _| *pg != g);
                                     priv_vals.dyn_vals.retain(|(pg, _, _), _| *pg != g);
-                                    pending_const_stores.retain(|(pg, _, _), _| *pg != g);
+                                    pending_const_stores.retain(|(pg, _), _| *pg != g);
                                     pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
                                 }
                                 PtrRoot::SharedGlobal(g) => {
-                                    shared_const.retain(|(pg, _, _), _| *pg != g);
+                                    shared_const.retain(|(pg, _), _| *pg != g);
                                     shared_dyn.retain(|(pg, _, _), _| *pg != g);
-                                    pending_const_stores.retain(|(pg, _, _), _| *pg != g);
+                                    pending_const_stores.retain(|(pg, _), _| *pg != g);
                                     pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
                                 }
                                 PtrRoot::Unknown | PtrRoot::ConstGlobal(_) => {
@@ -1841,7 +1876,7 @@ impl Module {
                                         shared_const.clear();
                                         shared_dyn.clear();
                                         unknown_loads.clear();
-                                        pending_const_stores.retain(|(pg, _, _), _| {
+                                        pending_const_stores.retain(|(pg, _), _| {
                                             self.globals[*pg as usize].space == 0
                                         });
                                         pending_dyn_stores.retain(|(pg, _, _), _| {
@@ -1923,9 +1958,33 @@ impl Module {
         true
     }
 
+    /// Whether a `dx.op.*` name is a pure value-only math intrinsic safe to
+    /// execute speculatively (never accesses descriptors, resources, inputs,
+    /// or memory, and never traps on any bit pattern).
+    fn is_speculatable_pure_call(name: &str) -> bool {
+        let base = name.split('.').next().unwrap_or(name);
+        matches!(
+            base,
+            "unary"
+                | "unaryBits"
+                | "binary"
+                | "tertiary"
+                | "quaternary"
+                | "isSpecialFloat"
+                | "legacyF16ToF32"
+                | "legacyF32ToF16"
+                | "makeDouble"
+                | "splitDouble"
+                | "dot2"
+                | "dot3"
+                | "dot4"
+        )
+    }
+
     /// Whether instruction `i` inside a loop is pure, non-trapping, and safe to
-    /// hoist to the loop preheader (`guaranteed`: its block executes on every
-    /// entry to the loop).
+    /// hoist to the loop preheader (`guaranteed`: `i` executes on every entry
+    /// to the loop with the exact same active lanes as the preheader, before
+    /// any `dx.op.discard` or unknown side-effecting call).
     fn can_hoist(&self, effects: &[Effect], i: u32, guaranteed: bool) -> bool {
         match &self.insts[i as usize].op {
             Op::Bin(Bin::UDiv | Bin::URem, _, rhs) => {
@@ -1942,24 +2001,19 @@ impl Module {
             | Op::Gep(..) => true,
             Op::Load(p) => {
                 self.class(effects, i) == Effect::Pure
-                    && (guaranteed || self.is_in_bounds_const_global_ptr(*p))
+                    && (guaranteed
+                        || self.is_in_bounds_const_global_ptr(*p, self.insts[i as usize].ty))
             }
-            Op::Call(f, args) => {
+            Op::Call(f, _) => {
                 if effects[*f as usize] != Effect::Pure {
                     return false;
                 }
+                if guaranteed {
+                    return true;
+                }
                 let name = self.funcs[*f as usize].name.as_str();
                 let name = name.strip_prefix("dx.op.").unwrap_or(name);
-                if name == "createHandleFromHeap" {
-                    let non_uniform = args
-                        .get(3)
-                        .and_then(|&v| self.int_k(v))
-                        .is_some_and(|(_, k)| k != 0);
-                    let const_idx = args.get(1).and_then(|&v| self.int_k(v)).is_some();
-                    guaranteed || non_uniform || const_idx
-                } else {
-                    true
-                }
+                Self::is_speculatable_pure_call(name)
             }
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) | Op::Phi(_) => false,
         }
@@ -2123,20 +2177,40 @@ impl Module {
                 _ => continue,
             };
 
-            let exits: Vec<usize> = tree
-                .order
-                .iter()
-                .copied()
-                .filter(|&b| {
-                    loops[idx].in_loop[b]
-                        && match self.blocks[b].term {
-                            Some(Term::Ret) => true,
-                            term => successors(term)
-                                .iter()
-                                .any(|&s| !loops[idx].in_loop[s]),
-                        }
-                })
-                .collect();
+            // Blocks reached unconditionally from `header` along a single-pred /
+            // single-succ `Term::Br` chain without any intervening
+            // `WriteKind::All` call (e.g. `dx.op.discard`). Instructions in
+            // these blocks (before any `WriteKind::All` in the block itself)
+            // run on every loop entry with the exact same active lanes as the
+            // preheader, preserving dynamic uniformity and preventing
+            // speculation past conditional branches or discards.
+            let mut guaranteed_blocks = vec![false; self.blocks.len()];
+            let mut cur = header;
+            loop {
+                if guaranteed_blocks[cur] {
+                    break;
+                }
+                guaranteed_blocks[cur] = true;
+                let has_barrier_exit = self.blocks[cur].body.iter().any(|&inst_id| {
+                    matches!(self.insts[inst_id as usize].op, Op::Call(f, _)
+                        if effects[f as usize] == Effect::Writes
+                            && write_kind(&self.funcs[f as usize]) == WriteKind::All)
+                });
+                if has_barrier_exit {
+                    break;
+                }
+                match self.blocks[cur].term {
+                    Some(Term::Br(next))
+                        if loops[idx].in_loop[next]
+                            && next != header
+                            && tree.preds[next].len() == 1
+                            && tree.preds[next][0] == cur =>
+                    {
+                        cur = next;
+                    }
+                    _ => break,
+                }
+            }
             let loop_blocks: Vec<usize> = tree
                 .order
                 .iter()
@@ -2147,12 +2221,16 @@ impl Module {
             loop {
                 let mut round_changed = false;
                 for &b in &loop_blocks {
-                    let guaranteed = b == header
-                        || (!exits.is_empty()
-                            && exits.iter().all(|&ex| dominates(&tree.idom, b, ex)));
+                    let mut guaranteed = guaranteed_blocks[b];
                     let body = std::mem::take(&mut self.blocks[b].body);
                     let mut kept = Vec::with_capacity(body.len());
                     for i in body {
+                        if let Op::Call(f, _) = self.insts[i as usize].op
+                            && effects[f as usize] == Effect::Writes
+                            && write_kind(&self.funcs[f as usize]) == WriteKind::All
+                        {
+                            guaranteed = false;
+                        }
                         let dom_target = preheader.unwrap_or(entry_pred);
                         if self.can_hoist(&effects, i, guaranteed)
                             && self.operands_invariant(
@@ -4106,6 +4184,524 @@ mod tests {
         );
         assert_eq!(barrier_modes(next), vec![9], "cross-block barrier must stay");
         k.m.write();
+    }
+
+    #[test]
+    fn ptr_path_aliasing_scalar_aggregate_signed_multidim_and_deep_gep() {
+        // 1a-i: Scalar global `V::Global(g)` vs `gep ty, g, 0` MUST canonicalize to the same slot.
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let ptr_i32 = k.m.ptr(i32t);
+            let g = k.m.global("scalar_g", i32t, 0);
+            let (k0, k1, k2) = (k.m.i32(0), k.m.i32(1), k.m.i32(2));
+            let v1 = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let v2 = k.m.call(k.b, k.reads, vec![k1, k1]);
+            let g_gep0 = k.m.push(k.b, ptr_i32, Op::Gep(i32t, g, vec![k0]));
+            k.m.store(k.b, g, v1);
+            let read_via_gep = k.m.load(k.b, g_gep0); // must see v1!
+            k.m.store(k.b, g_gep0, v2);
+            let read_via_global = k.m.load(k.b, g); // must see v2, NOT stale v1!
+            k.m.call(k.b, k.writes, vec![read_via_gep, read_via_global]);
+            k.m.terminate(k.b, Term::Ret);
+            k.m.optimise(LOADS | DEAD);
+            assert_eq!(
+                stores(&k.m, k.b),
+                [[v1, v2]],
+                "scalar V::Global(g) and gep(i32, g, 0) must share canonical slot"
+            );
+            // Also verify `Store(g, v1)` is NOT unsafely deleted when `Load(gep(g,0))`
+            // cannot be forwarded (e.g., after an unknown read or with SharedGlobal).
+            let mut k2m = kit();
+            let i32t = k2m.m.int(32);
+            let ptr_lds = k2m.m.ptr_in(i32t, 3);
+            let sg = k2m.m.global("scalar_lds", i32t, 3);
+            let (z0, z1) = (k2m.m.i32(0), k2m.m.i32(1));
+            let a = k2m.m.call(k2m.b, k2m.reads, vec![z0, z0]);
+            let b = k2m.m.call(k2m.b, k2m.reads, vec![z1, z1]);
+            let sg_gep0 = k2m.m.push(k2m.b, ptr_lds, Op::Gep(i32t, sg, vec![z0]));
+            k2m.m.store(k2m.b, sg, a);
+            k2m.m.store(k2m.b, sg_gep0, b);
+            let out = k2m.m.load(k2m.b, sg);
+            k2m.m.call(k2m.b, k2m.writes, vec![out, z0]);
+            k2m.m.terminate(k2m.b, Term::Ret);
+            k2m.m.optimise(LOADS | DEAD);
+            assert_eq!(stores(&k2m.m, k2m.b), [[b, z0]], "LDS scalar alias must forward b");
+            let rem_stores = k2m.m.blocks[k2m.b]
+                .body
+                .iter()
+                .filter(|&&id| matches!(k2m.m.insts[id as usize].op, Op::Store(..)))
+                .count();
+            assert_eq!(rem_stores, 1, "overwritten store via equivalent scalar GEP drops first");
+            let _ = k2;
+        }
+
+        // 1a-ii: Whole-aggregate store/load vs field access MUST invalidate each other.
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let st_ty = k.m.named_struct("pair", vec![i32t, i32t]);
+            let ptr_i32 = k.m.ptr(i32t);
+            let g = k.m.global("agg_g", st_ty, 0);
+            let (k0, k1) = (k.m.i32(0), k.m.i32(1));
+            let v1 = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let v2 = k.m.call(k.b, k.reads, vec![k1, k1]);
+            let agg_k = k.m.aggregate(st_ty, &[k1, k1]);
+            let f0 = k.m.push(k.b, ptr_i32, Op::Gep(st_ty, g, vec![k0, k0]));
+            // Store field -> whole-aggregate load -> overwrite field: first field store MUST stay!
+            k.m.store(k.b, f0, v1);
+            let whole = k.m.load(k.b, g);
+            let whole_f0 = k.m.extract(k.b, whole, 0);
+            k.m.store(k.b, f0, v2);
+            // Whole-aggregate store invalidates cached field value -> next field load MUST reload!
+            k.m.store(k.b, g, agg_k);
+            let f0_after_agg = k.m.load(k.b, f0);
+            k.m.call(k.b, k.writes, vec![whole_f0, f0_after_agg]);
+            k.m.terminate(k.b, Term::Ret);
+            k.m.optimise(LOADS | DEAD);
+            assert_eq!(
+                stores(&k.m, k.b),
+                [[whole_f0, f0_after_agg]],
+                "whole-aggregate store must invalidate field load (no stale v2)"
+            );
+            let f0_stores = k.m.blocks[k.b]
+                .body
+                .iter()
+                .filter(|&&id| matches!(k.m.insts[id as usize].op, Op::Store(p, _) if p == f0))
+                .count();
+            assert_eq!(f0_stores, 2, "whole-aggregate load must preserve preceding field store");
+        }
+
+        // 1b: Signed negative GEP index (`gep i32, (gep [4 x i32], g, 0, 1), -1` == `[0]`,
+        //     and OOB `gep i32, (gep [4 x i32], g, 0, 0), -1` falls back to Dynamic).
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let ptr_i32 = k.m.ptr(i32t);
+            let arr = k.m.array(4, i32t);
+            let g = k.m.global("signed_g", arr, 0);
+            let (k0, k1, km1) = (k.m.i32(0), k.m.i32(1), k.m.i32(u32::MAX));
+            let v1 = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let v2 = k.m.call(k.b, k.reads, vec![k1, k1]);
+            let p0 = k.m.element(k.b, g, k0);
+            let p1 = k.m.element(k.b, g, k1);
+            let p1_m1 = k.m.push(k.b, ptr_i32, Op::Gep(i32t, p1, vec![km1]));
+            let p0_m1 = k.m.push(k.b, ptr_i32, Op::Gep(i32t, p0, vec![km1]));
+
+            // In-bounds negative step `1 + (-1) == 0` aliases `p0`: must forward `v2`!
+            k.m.store(k.b, p0, v1);
+            k.m.store(k.b, p1_m1, v2);
+            let after_inbounds = k.m.load(k.b, p0);
+
+            // OOB negative step `0 + (-1) == -1` falls back to Dynamic:
+            // Load must prevent DSE of `p0`, and Store must invalidate `p0`!
+            k.m.store(k.b, p0, v1);
+            let oob_rd = k.m.load(k.b, p0_m1);
+            k.m.store(k.b, p0, v2);
+            k.m.store(k.b, p0_m1, v1);
+            let after_oob_st = k.m.load(k.b, p0);
+
+            k.m.call(k.b, k.writes, vec![after_inbounds, oob_rd]);
+            k.m.call(k.b, k.writes, vec![after_oob_st, k0]);
+            k.m.terminate(k.b, Term::Ret);
+            k.m.optimise(LOADS | DEAD);
+            let st = stores(&k.m, k.b);
+            assert_eq!(st[0][0], v2, "gep(p1, -1) must alias p0 and forward v2");
+            assert_eq!(st[1][0], after_oob_st, "OOB negative GEP store must invalidate p0");
+            let p0_stores = k.m.blocks[k.b]
+                .body
+                .iter()
+                .filter(|&&id| matches!(k.m.insts[id as usize].op, Op::Store(p, _) if p == p0))
+                .count();
+            assert_eq!(p0_stores, 2, "OOB negative GEP load must preserve earlier p0 store");
+        }
+
+        // 1c: Multi-dimensional array flattening `gep i32, (gep [2 x [2 x i32]], g, 0, 0, 1), 1`
+        //     aliases `gep g, 0, 1, 0` -> must fall back to Dynamic (no stale forward, no DSE).
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let ptr_i32 = k.m.ptr(i32t);
+            let inner = k.m.array(2, i32t);
+            let outer = k.m.array(2, inner);
+            let g = k.m.global("md_g", outer, 0);
+            let (k0, k1) = (k.m.i32(0), k.m.i32(1));
+            let v1 = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let v2 = k.m.call(k.b, k.reads, vec![k1, k1]);
+            let p10 = k.m.push(k.b, ptr_i32, Op::Gep(outer, g, vec![k0, k1, k0]));
+            let p01 = k.m.push(k.b, ptr_i32, Op::Gep(outer, g, vec![k0, k0, k1]));
+            let p01_flat = k.m.push(k.b, ptr_i32, Op::Gep(i32t, p01, vec![k1]));
+
+            k.m.store(k.b, p10, v1);
+            let rd_flat = k.m.load(k.b, p01_flat); // reads [1, 0] via flattened GEP!
+            k.m.store(k.b, p10, v2);
+            k.m.store(k.b, p01_flat, v1); // overwrites [1, 0] via flattened GEP!
+            let rd_p10 = k.m.load(k.b, p10); // MUST NOT forward stale v2!
+
+            k.m.call(k.b, k.writes, vec![rd_flat, rd_p10]);
+            k.m.terminate(k.b, Term::Ret);
+            k.m.optimise(LOADS | DEAD);
+            assert_eq!(
+                stores(&k.m, k.b),
+                [[rd_flat, rd_p10]],
+                "flattened multi-dim GEP store must invalidate [1, 0]"
+            );
+            let p10_stores = k.m.blocks[k.b]
+                .body
+                .iter()
+                .filter(|&&id| matches!(k.m.insts[id as usize].op, Op::Store(p, _) if p == p10))
+                .count();
+            assert_eq!(
+                p10_stores, 2,
+                "flattened multi-dim GEP load must prevent DSE of [1, 0] store"
+            );
+        }
+
+        // 1d: Deep GEP chains (>32 hops) MUST agree with `escaped_globals` and invalidate `g`.
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let ptr_i32 = k.m.ptr(i32t);
+            let arr = k.m.array(4, i32t);
+            let g = k.m.global("deep_g", arr, 0);
+            let (k0, k1, k2) = (k.m.i32(0), k.m.i32(1), k.m.i32(2));
+            let v1 = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let v2 = k.m.call(k.b, k.reads, vec![k1, k1]);
+            let dyn_idx = k.m.call(k.b, k.reads, vec![k2, k2]);
+            let p0 = k.m.element(k.b, g, k0);
+            let mut p_deep_const = p0;
+            let mut p_deep_dyn = k.m.element(k.b, g, dyn_idx);
+            for _ in 0..35 {
+                p_deep_const = k.m.push(k.b, ptr_i32, Op::Gep(i32t, p_deep_const, vec![k0]));
+                p_deep_dyn = k.m.push(k.b, ptr_i32, Op::Gep(i32t, p_deep_dyn, vec![k0]));
+            }
+
+            // 36-hop const chain aliases p0 -> forwards v2 (not stale v1).
+            k.m.store(k.b, p0, v1);
+            k.m.store(k.b, p_deep_const, v2);
+            let after_deep_const = k.m.load(k.b, p0);
+
+            // 36-hop dynamic chain must invalidate p0 on Store, Load (prevent DSE), and AtomicRmw.
+            k.m.store(k.b, p0, v1);
+            let deep_rd = k.m.load(k.b, p_deep_dyn);
+            k.m.store(k.b, p0, v2);
+            k.m.store(k.b, p_deep_dyn, v1);
+            let after_deep_st = k.m.load(k.b, p0);
+            k.m.store(k.b, p0, v2);
+            let deep_rmw = k.m.atomic(k.b, crate::emit::bitcode::Rmw::Add, p_deep_dyn, k1);
+            let after_deep_rmw = k.m.load(k.b, p0);
+
+            k.m.call(k.b, k.writes, vec![after_deep_const, deep_rd]);
+            k.m.call(k.b, k.writes, vec![after_deep_st, deep_rmw]);
+            k.m.call(k.b, k.writes, vec![after_deep_rmw, k0]);
+            k.m.terminate(k.b, Term::Ret);
+            k.m.optimise(LOADS | DEAD);
+            let st = stores(&k.m, k.b);
+            assert_eq!(st[0][0], v2, "36-hop constant GEP must alias p0");
+            assert_eq!(st[1][0], after_deep_st, "36-hop dynamic GEP store must invalidate p0");
+            assert_eq!(st[2][0], after_deep_rmw, "36-hop dynamic GEP atomic must invalidate p0");
+            let p0_stores = k.m.blocks[k.b]
+                .body
+                .iter()
+                .filter(|&&id| matches!(k.m.insts[id as usize].op, Op::Store(p, _) if p == p0))
+                .count();
+            assert_eq!(
+                p0_stores, 3,
+                "36-hop dynamic load/store/atomic must preserve all 3 live p0 stores"
+            );
+        }
+    }
+
+    #[test]
+    fn licm_negative_controls_speculative_resources_uniformity_discard_and_signed_const_gep() {
+        let inst_id = |v: V| match v {
+            V::Inst(i) => i,
+            _ => panic!("expected V::Inst, got {v:?}"),
+        };
+
+        // 2a: Conditional `if (valid)` inside loop MUST NOT speculatively hoist
+        //     createHandleFromHeap (even with nonUniform=true or const idx),
+        //     annotateHandle, cbufferLoadLegacy, or getDimensions, while pure
+        //     math (`unary.f32`) in the same conditional block still hoists.
+        {
+            let mut k = kit();
+            let (i32t, i1t, f32t) = (k.m.int(32), k.m.int(1), k.m.float());
+            let hty = k.m.func_ty(i32t, vec![i32t, i32t, i1t, i1t]);
+            let aty = k.m.func_ty(i32t, vec![i32t, i32t, i32t]);
+            let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+            let uty = k.m.func_ty(f32t, vec![i32t, f32t]);
+            let heap =
+                k.m.function("dx.op.createHandleFromHeap", hty, Some(Attr::ReadNone), false);
+            let ann = k.m.function("dx.op.annotateHandle", aty, Some(Attr::ReadNone), false);
+            let cb = k.m.function("dx.op.cbufferLoadLegacy.i32", fty, Some(Attr::ReadOnly), false);
+            let dims = k.m.function("dx.op.getDimensions", fty, Some(Attr::ReadOnly), false);
+            let unary = k.m.function("dx.op.unary.f32", uty, Some(Attr::ReadNone), false);
+            let (k0, k1, k4, k13, k59, k72, k216, k218) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(4),
+                k.m.i32(13),
+                k.m.i32(59),
+                k.m.i32(72),
+                k.m.i32(216),
+                k.m.i32(218),
+            );
+            let (yes, no) = (k.m.bool(true), k.m.bool(false));
+            let slot = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let cond_val = k.m.call(k.b, k.reads, vec![k1, k0]);
+            let xf = k.m.cast(k.b, Cast::Bitcast, slot, f32t);
+
+            let (head, guarded, latch, exit) = (
+                k.m.new_block(),
+                k.m.new_block(),
+                k.m.new_block(),
+                k.m.new_block(),
+            );
+            k.m.terminate(k.b, Term::Br(head));
+            let idx = k.m.phi(head, i32t);
+            let has_valid = k.m.cmp(head, pred::NE, cond_val, k0);
+            k.m.terminate(head, Term::CondBr(has_valid, guarded, latch));
+
+            let h_dyn_nu = k.m.call(guarded, heap, vec![k218, slot, no, yes]);
+            let h_const = k.m.call(guarded, heap, vec![k218, k0, no, no]);
+            let h_ann = k.m.call(guarded, ann, vec![k216, h_dyn_nu, k0]);
+            let cb_v = k.m.call(guarded, cb, vec![k59, h_ann]);
+            let dim_v = k.m.call(guarded, dims, vec![k72, h_const]);
+            let pure_sin = k.m.call(guarded, unary, vec![k13, xf]);
+            let sin_i = k.m.cast(guarded, Cast::Bitcast, pure_sin, i32t);
+            let sum = k.m.bin(guarded, Bin::Add, cb_v, dim_v);
+            let sum2 = k.m.bin(guarded, Bin::Add, sum, sin_i);
+            k.m.call(guarded, k.writes, vec![idx, sum2]);
+            k.m.terminate(guarded, Term::Br(latch));
+
+            let next = k.m.bin(latch, Bin::Add, idx, k1);
+            let more = k.m.cmp(latch, pred::IULT, next, k4);
+            k.m.terminate(latch, Term::CondBr(more, head, exit));
+            k.m.set_phi(idx, vec![(k0, k.b), (next, latch)]);
+            k.m.terminate(exit, Term::Ret);
+
+            k.m.optimise(LICM);
+            for v in [h_dyn_nu, h_const, h_ann, cb_v, dim_v] {
+                assert!(
+                    k.m.blocks[guarded].body.contains(&inst_id(v)),
+                    "guarded resource/query call {v:?} MUST NOT hoist speculatively"
+                );
+                assert!(!k.m.blocks[k.b].body.contains(&inst_id(v)));
+            }
+            assert!(
+                k.m.blocks[k.b].body.contains(&inst_id(pure_sin)),
+                "pure math unary.f32 in guarded block is safe to hoist"
+            );
+            k.m.write();
+        }
+
+        // 2b-i: `header: condbr %c, body, header; body: ... condbr %done, exit, header`
+        //       (`body` dominates all `exits` yet is NOT guaranteed on iter 0):
+        //       MUST NOT hoist uniform `createHandleFromHeap`, `cbufferLoadLegacy`, or
+        //       dynamic `Op::Load(ConstGlobal)` from `body`.
+        {
+            let mut k = kit();
+            let (i32t, i1t) = (k.m.int(32), k.m.int(1));
+            let arr4 = k.m.array(4, i32t);
+            let c_init = k.m.undef(arr4);
+            let cg = k.m.constant_global("tbl", c_init);
+            let hty = k.m.func_ty(i32t, vec![i32t, i32t, i1t, i1t]);
+            let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+            let heap =
+                k.m.function("dx.op.createHandleFromHeap", hty, Some(Attr::ReadNone), false);
+            let cb = k.m.function("dx.op.cbufferLoadLegacy.i32", fty, Some(Attr::ReadOnly), false);
+            let (k0, k1, k4, k59, k218) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(4),
+                k.m.i32(59),
+                k.m.i32(218),
+            );
+            let no = k.m.bool(false);
+            let dyn_idx = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let ptr_dyn = k.m.element(k.b, cg, dyn_idx);
+
+            let (head, body, exit) = (k.m.new_block(), k.m.new_block(), k.m.new_block());
+            k.m.terminate(k.b, Term::Br(head));
+            let iter = k.m.phi(head, i32t);
+            let next_h = k.m.bin(head, Bin::Add, iter, k1);
+            let ready = k.m.cmp(head, pred::EQ, iter, dyn_idx);
+            k.m.terminate(head, Term::CondBr(ready, body, head));
+
+            let h_unif = k.m.call(body, heap, vec![k218, dyn_idx, no, no]);
+            let cb_v = k.m.call(body, cb, vec![k59, h_unif]);
+            let dyn_cg_load = k.m.load(body, ptr_dyn);
+            let sum = k.m.bin(body, Bin::Add, cb_v, dyn_cg_load);
+            k.m.call(body, k.writes, vec![iter, sum]);
+            let done = k.m.cmp(body, pred::IUGE, next_h, k4);
+            k.m.terminate(body, Term::CondBr(done, exit, head));
+            k.m.set_phi(iter, vec![(k0, k.b), (next_h, head), (next_h, body)]);
+            k.m.terminate(exit, Term::Ret);
+
+            k.m.optimise(LICM);
+            for v in [h_unif, cb_v, dyn_cg_load] {
+                assert!(
+                    k.m.blocks[body].body.contains(&inst_id(v)),
+                    "{v:?} in continue-skipped exit-dominating body MUST NOT hoist"
+                );
+                assert!(!k.m.blocks[k.b].body.contains(&inst_id(v)));
+            }
+            k.m.write();
+        }
+
+        // 2b-ii: `dx.op.discard` inside `header` stops `guaranteed` for subsequent ops
+        //        in `header` and any `Term::Br` successor block, while ops BEFORE `discard`
+        //        and clean `header -> Br(b1)` chains without `discard` DO hoist.
+        {
+            let mut k = kit();
+            let (i32t, i1t, void) = (k.m.int(32), k.m.int(1), k.m.void());
+            let dty = k.m.func_ty(void, vec![i32t, i1t]);
+            let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+            k.m.ptr(dty);
+            let discard = k.m.function("dx.op.discard", dty, Some(Attr::NoUnwind), false);
+            let cb = k.m.function("dx.op.cbufferLoadLegacy.i32", fty, Some(Attr::ReadOnly), false);
+            let arr4 = k.m.array(4, i32t);
+            let c_init = k.m.undef(arr4);
+            let cg = k.m.constant_global("tbl_d", c_init);
+            let (k0, k1, k4, k59, k82) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(4),
+                k.m.i32(59),
+                k.m.i32(82),
+            );
+            let dyn_idx = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let bad = k.m.cmp(k.b, pred::IUGE, dyn_idx, k4);
+            let ptr_dyn = k.m.element(k.b, cg, dyn_idx);
+
+            let (head, b1, exit) = (k.m.new_block(), k.m.new_block(), k.m.new_block());
+            k.m.terminate(k.b, Term::Br(head));
+            let iter = k.m.phi(head, i32t);
+            let cb_before = k.m.call(head, cb, vec![k59, k0]);
+            k.m.call(head, discard, vec![k82, bad]);
+            let cb_after = k.m.call(head, cb, vec![k59, k1]);
+            let load_after = k.m.load(head, ptr_dyn);
+            k.m.terminate(head, Term::Br(b1));
+
+            let cb_in_b1 = k.m.call(b1, cb, vec![k59, k4]);
+            let s0 = k.m.bin(b1, Bin::Add, cb_before, cb_after);
+            let s1 = k.m.bin(b1, Bin::Add, s0, load_after);
+            let s2 = k.m.bin(b1, Bin::Add, s1, cb_in_b1);
+            k.m.call(b1, k.writes, vec![iter, s2]);
+            let next = k.m.bin(b1, Bin::Add, iter, k1);
+            let more = k.m.cmp(b1, pred::IULT, next, k4);
+            k.m.terminate(b1, Term::CondBr(more, head, exit));
+            k.m.set_phi(iter, vec![(k0, k.b), (next, b1)]);
+            k.m.terminate(exit, Term::Ret);
+
+            k.m.optimise(LICM);
+            assert!(
+                k.m.blocks[k.b].body.contains(&inst_id(cb_before)),
+                "cbufferLoadLegacy BEFORE discard in header must hoist"
+            );
+            assert!(
+                k.m.blocks[head].body.contains(&inst_id(cb_after)),
+                "cbufferLoadLegacy AFTER discard in header must NOT hoist"
+            );
+            assert!(
+                k.m.blocks[head].body.contains(&inst_id(load_after)),
+                "dynamic ConstGlobal load AFTER discard in header must NOT hoist"
+            );
+            assert!(
+                k.m.blocks[b1].body.contains(&inst_id(cb_in_b1)),
+                "cbufferLoadLegacy in block after discard must NOT hoist"
+            );
+            k.m.write();
+        }
+
+        // Positive control for 2b: clean `header -> Br(b1)` without `discard` DOES hoist from `b1`.
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+            let cb = k.m.function("dx.op.cbufferLoadLegacy.i32", fty, Some(Attr::ReadOnly), false);
+            let (k0, k1, k4, k59) = (k.m.i32(0), k.m.i32(1), k.m.i32(4), k.m.i32(59));
+            let (head, b1, exit) = (k.m.new_block(), k.m.new_block(), k.m.new_block());
+            k.m.terminate(k.b, Term::Br(head));
+            let iter = k.m.phi(head, i32t);
+            k.m.terminate(head, Term::Br(b1));
+            let cb_b1 = k.m.call(b1, cb, vec![k59, k0]);
+            k.m.call(b1, k.writes, vec![iter, cb_b1]);
+            let next = k.m.bin(b1, Bin::Add, iter, k1);
+            let more = k.m.cmp(b1, pred::IULT, next, k4);
+            k.m.terminate(b1, Term::CondBr(more, head, exit));
+            k.m.set_phi(iter, vec![(k0, k.b), (next, b1)]);
+            k.m.terminate(exit, Term::Ret);
+            k.m.optimise(LICM);
+            assert!(
+                k.m.blocks[k.b].body.contains(&inst_id(cb_b1)),
+                "unconditional single-pred Br chain from header with no discard must hoist"
+            );
+            k.m.write();
+        }
+
+        // 2c: `is_in_bounds_const_global_ptr` rejects signed `i8(-1)` into `[512 x i32]`
+        //     and rejects mismatched GEP `arr_ty`, while allowing provably in-bounds `i32(7)`.
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let ptr_i32 = k.m.ptr(i32t);
+            let arr512 = k.m.array(512, i32t);
+            let arr4 = k.m.array(4, i32t);
+            let c_init = k.m.undef(arr512);
+            let cg = k.m.constant_global("big_tbl", c_init);
+            let (k0, k1, k4, k7, km1_i8) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(4),
+                k.m.i32(7),
+                k.m.i8(u8::MAX),
+            );
+            let flag = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let p_neg_i8 = k.m.push(k.b, ptr_i32, Op::Gep(arr512, cg, vec![k0, km1_i8]));
+            let p_mismatch = k.m.push(k.b, ptr_i32, Op::Gep(arr4, cg, vec![k0, k1]));
+            let p_ok = k.m.push(k.b, ptr_i32, Op::Gep(arr512, cg, vec![k0, k7]));
+
+            let (head, guarded, latch, exit) = (
+                k.m.new_block(),
+                k.m.new_block(),
+                k.m.new_block(),
+                k.m.new_block(),
+            );
+            k.m.terminate(k.b, Term::Br(head));
+            let iter = k.m.phi(head, i32t);
+            let cond = k.m.cmp(head, pred::NE, flag, k0);
+            k.m.terminate(head, Term::CondBr(cond, guarded, latch));
+
+            let ld_neg = k.m.load(guarded, p_neg_i8);
+            let ld_mis = k.m.load(guarded, p_mismatch);
+            let ld_ok = k.m.load(guarded, p_ok);
+            let s0 = k.m.bin(guarded, Bin::Add, ld_neg, ld_mis);
+            let s1 = k.m.bin(guarded, Bin::Add, s0, ld_ok);
+            k.m.call(guarded, k.writes, vec![iter, s1]);
+            k.m.terminate(guarded, Term::Br(latch));
+
+            let next = k.m.bin(latch, Bin::Add, iter, k1);
+            let more = k.m.cmp(latch, pred::IULT, next, k4);
+            k.m.terminate(latch, Term::CondBr(more, head, exit));
+            k.m.set_phi(iter, vec![(k0, k.b), (next, latch)]);
+            k.m.terminate(exit, Term::Ret);
+
+            k.m.optimise(LICM);
+            assert!(
+                k.m.blocks[guarded].body.contains(&inst_id(ld_neg)),
+                "i8(-1) ConstGlobal GEP is OOB and MUST NOT hoist speculatively"
+            );
+            assert!(
+                k.m.blocks[guarded].body.contains(&inst_id(ld_mis)),
+                "mismatched arr_ty ConstGlobal GEP MUST NOT hoist speculatively"
+            );
+            assert!(
+                k.m.blocks[k.b].body.contains(&inst_id(ld_ok)),
+                "provably in-bounds ConstGlobal GEP load must hoist"
+            );
+            k.m.write();
+        }
     }
 
     // ---- dxil.dll validation, real RTX 4070 SUPER hardware parity & GPU timestamps ----
