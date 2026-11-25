@@ -45,11 +45,10 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Dynamic slots (`0..dynamic`) free-list allocator: O(1) bitmask-indexed
-    /// exact buckets for small runs (`1..=32`) and O(log K) coalescing extents
-    /// for larger runs, eliminating linear full-ring walks under churn.
-    dynamic_pool: Mutex<DynamicPool>,
-    /// How many dynamic slots are free (updated under `dynamic_pool`'s lock):
+    /// Where the search for free dynamic slots starts, and which are taken
+    /// (by lists not yet reset).
+    next: Mutex<(u32, DynamicPool)>,
+    /// How many dynamic slots are free (updated under `next`'s lock):
     /// lock-free early rejection when fewer than `n` slots remain.
     free: std::sync::atomic::AtomicU32,
     /// View heaps: the bytes per element of the buffer view at each title
@@ -859,6 +858,166 @@ impl DynamicPool {
     }
 }
 
+#[cfg(test)]
+mod dynamic_pool_tests {
+    use super::{DYNAMIC, DynamicPool, HostHeap};
+
+    /// High-churn fragmented dynamic descriptor allocation stress benchmark.
+    #[test]
+    fn dynamic_slot_high_churn_stress_benchmark() {
+        let Some(heap) = HostHeap::new(false, 700_000) else {
+            return; // no host GPU
+        };
+        let cap = heap.dynamic;
+        // Phase 1: fill ~92% of dynamic slots with alternating sizes 1..=16,
+        // then release every other block to create heavy fragmentation with
+        // thousands of small holes and no contiguous run >= 64.
+        let mut live: Vec<(u32, u32)> = Vec::new();
+        let mut used = 0u32;
+        let target_fill = cap / 100 * 92;
+        let mut step = 0u32;
+        while used + 16 < target_fill {
+            let n = [1u32, 2, 4, 8, 12, 16][(step % 6) as usize];
+            let Some(first) = heap.dynamic(n) else {
+                break;
+            };
+            live.push((first, n));
+            used += n;
+            step += 1;
+        }
+        // Keep odd entries pinned; release even entries so max hole is <= 16.
+        let mut pinned: Vec<(u32, u32)> = Vec::with_capacity(live.len() / 2);
+        for (i, &(first, n)) in live.iter().enumerate() {
+            if i % 2 == 0 {
+                heap.release(first, n);
+            } else {
+                pinned.push((first, n));
+            }
+        }
+        // Pin remaining tail so no large contiguous run remains at the end.
+        let mut tail_pinned: Vec<(u32, u32)> = Vec::new();
+        while let Some(first) = heap.dynamic(32) {
+            tail_pinned.push((first, 32));
+        }
+
+        // Phase 2: interleaved churn — large requests (n = 64) that cannot fit,
+        // mixed with small allocations (n = 1, 4, 8) and ongoing releases.
+        const ITERS: usize = 5_000;
+        let mut small_ok = 0usize;
+        let mut small_refused = 0usize;
+        let mut large_refused = 0usize;
+        let mut ring: Vec<(u32, u32)> = Vec::with_capacity(64);
+        let started = std::time::Instant::now();
+        for i in 0..ITERS {
+            // Every 5th iteration, request an oversized table (cannot fit).
+            if i % 5 == 0 {
+                if let Some(first) = heap.dynamic(64) {
+                    heap.release(first, 64);
+                } else {
+                    large_refused += 1;
+                }
+            }
+            let n = [1u32, 1, 4, 8][i % 4];
+            match heap.dynamic(n) {
+                Some(first) => {
+                    small_ok += 1;
+                    ring.push((first, n));
+                    if ring.len() >= 32 {
+                        let (old_first, old_n) = ring.remove(0);
+                        heap.release(old_first, old_n);
+                    }
+                }
+                None => {
+                    small_refused += 1;
+                    if let Some((old_first, old_n)) = ring.pop() {
+                        heap.release(old_first, old_n);
+                    }
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+        for (first, n) in ring.into_iter().chain(pinned).chain(tail_pinned) {
+            heap.release(first, n);
+        }
+        println!(
+            "DYNAMIC_BENCH count={} dynamic_cap={} iters={} elapsed_us={} ns_per_iter={} small_ok={} small_refused={} large_refused={}",
+            heap.count(),
+            cap,
+            ITERS,
+            elapsed.as_micros(),
+            elapsed.as_nanos() / ITERS as u128,
+            small_ok,
+            small_refused,
+            large_refused,
+        );
+        assert_eq!(small_ok, ITERS, "small allocations must not be starved by failed large requests");
+        assert_eq!(small_refused, 0);
+        assert_eq!(large_refused, ITERS / 5);
+        assert_eq!(
+            heap.free.load(std::sync::atomic::Ordering::Relaxed),
+            cap,
+            "all dynamic slots must coalesce back cleanly"
+        );
+    }
+
+    /// `DynamicPool` coalesces adjacent releases, ignores duplicate/overlapping
+    /// releases idempotently, and never starves small runs when large runs fail.
+    #[test]
+    fn dynamic_pool_coalescing_idempotent_release_and_no_starvation() {
+        let mut pool = DynamicPool::new(128);
+        let a = pool.alloc(16).unwrap();
+        let b = pool.alloc(32).unwrap();
+        let c = pool.alloc(16).unwrap();
+        let d = pool.alloc(64).unwrap();
+        assert_eq!((a, b, c, d), (0, 16, 48, 64));
+        assert_eq!(pool.free_count, 0);
+        assert_eq!(pool.alloc(1), None);
+
+        // Release a and c (non-adjacent), then b in the middle -> coalesces to [0, 64).
+        assert_eq!(pool.release(a, 16), 16);
+        assert_eq!(pool.release(c, 16), 16);
+        assert_eq!(pool.alloc(32), None, "two 16-slot holes cannot satisfy 32");
+        assert_eq!(pool.alloc(16), Some(c), "exact small-bucket fit still works");
+        assert_eq!(pool.release(c, 16), 16);
+        assert_eq!(pool.release(b, 32), 32);
+        assert_eq!(pool.free_count, 64);
+
+        // Duplicate and partially-overlapping releases are idempotent.
+        assert_eq!(pool.release(a, 16), 0);
+        assert_eq!(pool.release(0, 64), 0);
+        assert_eq!(pool.release(48, 32), 16, "only [64, 80) was still taken");
+        assert_eq!(pool.free_count, 80);
+
+        // Release remainder -> full coalesce back to one 128-slot run.
+        assert_eq!(pool.release(80, 48), 48);
+        assert_eq!(pool.free_count, 128);
+        assert_eq!(pool.by_start.len(), 1);
+        assert_eq!(pool.alloc(128), Some(0));
+    }
+
+    /// View heaps allocate all headroom between the title's count and `null`
+    /// to the dynamic pool instead of wasting already-allocated GPU descriptors.
+    #[test]
+    fn portable_view_heap_uses_full_headroom_up_to_null() {
+        let Some(heap) = HostHeap::new(false, 700_000) else {
+            return; // no host GPU
+        };
+        let null = victory_shader::emit::view_heap_limit();
+        assert!(null > 0);
+        assert_eq!(heap.count(), 700_000);
+        assert_eq!(heap.dynamic, null - 700_000);
+        assert!(heap.dynamic > DYNAMIC, "extra headroom past count must join dynamic pool");
+        assert_eq!(heap.count() + heap.dynamic, null);
+
+        // A title asking for more than the host limit keeps at least `DYNAMIC`.
+        let Some(capped) = HostHeap::new(false, null + 100_000) else {
+            return;
+        };
+        assert_eq!(capped.dynamic, DYNAMIC);
+        assert_eq!(capped.count() + capped.dynamic, null);
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -891,10 +1050,10 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
-        let (heap, count, dynamic, size) = if null == 0 {
-            let dynamic = if sampler { 0 } else { DYNAMIC };
-            match make(count + dynamic) {
-                Ok(heap) => (heap, count, dynamic, count + dynamic),
+        let (heap, count, extra, size) = if null == 0 {
+            let extra = if sampler { 0 } else { DYNAMIC };
+            match make(count + extra) {
+                Ok(heap) => (heap, count, extra, count + extra),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
@@ -902,7 +1061,7 @@ impl HostHeap {
             }
         } else {
             let size = null + 1;
-            let (fitted, dynamic) = if count.saturating_add(DYNAMIC) <= null {
+            let (fitted, extra) = if count.saturating_add(DYNAMIC) <= null {
                 // Hand all remaining slots past `count` up to `null` to the
                 // dynamic pool instead of wasting allocated heap capacity.
                 (count, null - count)
@@ -914,7 +1073,7 @@ impl HostHeap {
                 (null - dyn_cap, dyn_cap)
             };
             match make(size) {
-                Ok(heap) => (heap, fitted, dynamic, size),
+                Ok(heap) => (heap, fitted, extra, size),
                 Err(e) => {
                     tracing::warn!(error = %e, count, size, "no host view heap");
                     return None;
@@ -928,7 +1087,10 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
-        tracing::debug!(count, dynamic, sampler, "host descriptor heap");
+        tracing::debug!(count, dynamic = extra, sampler, "host descriptor heap");
+        // The null slot every index past the heap reads is the heap's last,
+        // past the dynamic slots (`probe_view_limit`): all of them are free.
+        let taken = DynamicPool::new(extra);
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
@@ -955,15 +1117,15 @@ impl HostHeap {
             cpu,
             step,
             count,
-            dynamic,
+            dynamic: extra,
             sampler,
             made: (0..count)
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
             made_lock: Mutex::new(()),
-            kept: Mutex::new(vec![None; (count + dynamic) as usize]),
-            dynamic_pool: Mutex::new(DynamicPool::new(dynamic)),
-            free: std::sync::atomic::AtomicU32::new(dynamic),
+            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            next: Mutex::new((0, taken)),
+            free: std::sync::atomic::AtomicU32::new(extra),
             strides,
             buffers: Mutex::new(std::array::from_fn(|_| std::collections::HashSet::new())),
             changed: Mutex::default(),
@@ -1079,13 +1241,13 @@ impl HostHeap {
         if self.free.load(Relaxed) < n {
             return refuse();
         }
-        let mut pool = self.dynamic_pool.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(first) = pool.alloc(n) else {
-            drop(pool);
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(first) = guard.1.alloc(n) else {
+            drop(guard);
             return refuse();
         };
-        self.free.store(pool.free_count, Relaxed);
-        drop(pool);
+        self.free.store(guard.1.free_count, Relaxed);
+        drop(guard);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         Some(self.count + first)
@@ -1661,11 +1823,11 @@ impl HostHeap {
         if n == 0 || at >= self.dynamic {
             return;
         }
-        let mut pool = self.dynamic_pool.lock().unwrap_or_else(|e| e.into_inner());
-        let freed = pool.release(at, n);
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let freed = guard.1.release(at, n);
         if freed > 0 {
             self.free
-                .store(pool.free_count, std::sync::atomic::Ordering::Relaxed);
+                .store(guard.1.free_count, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -3509,160 +3671,5 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 41));
-    }
-
-    /// High-churn fragmented dynamic descriptor allocation stress benchmark.
-    #[test]
-    fn dynamic_slot_high_churn_stress_benchmark() {
-        let Some(heap) = HostHeap::new(false, 700_000) else {
-            return; // no host GPU
-        };
-        let cap = heap.dynamic;
-        // Phase 1: fill ~92% of dynamic slots with alternating sizes 1..=16,
-        // then release every other block to create heavy fragmentation with
-        // thousands of small holes and no contiguous run >= 64.
-        let mut live: Vec<(u32, u32)> = Vec::new();
-        let mut used = 0u32;
-        let target_fill = cap / 100 * 92;
-        let mut step = 0u32;
-        while used + 16 < target_fill {
-            let n = [1u32, 2, 4, 8, 12, 16][(step % 6) as usize];
-            let Some(first) = heap.dynamic(n) else {
-                break;
-            };
-            live.push((first, n));
-            used += n;
-            step += 1;
-        }
-        // Keep odd entries pinned; release even entries so max hole is <= 16.
-        let mut pinned: Vec<(u32, u32)> = Vec::with_capacity(live.len() / 2);
-        for (i, &(first, n)) in live.iter().enumerate() {
-            if i % 2 == 0 {
-                heap.release(first, n);
-            } else {
-                pinned.push((first, n));
-            }
-        }
-        // Pin remaining tail so no large contiguous run remains at the end.
-        let mut tail_pinned: Vec<(u32, u32)> = Vec::new();
-        while let Some(first) = heap.dynamic(32) {
-            tail_pinned.push((first, 32));
-        }
-
-        // Phase 2: interleaved churn — large requests (n = 64) that cannot fit,
-        // mixed with small allocations (n = 1, 4, 8) and ongoing releases.
-        const ITERS: usize = 5_000;
-        let mut small_ok = 0usize;
-        let mut small_refused = 0usize;
-        let mut large_refused = 0usize;
-        let mut ring: Vec<(u32, u32)> = Vec::with_capacity(64);
-        let started = std::time::Instant::now();
-        for i in 0..ITERS {
-            // Every 5th iteration, request an oversized table (cannot fit).
-            if i % 5 == 0 {
-                if let Some(first) = heap.dynamic(64) {
-                    heap.release(first, 64);
-                } else {
-                    large_refused += 1;
-                }
-            }
-            let n = [1u32, 1, 4, 8][i % 4];
-            match heap.dynamic(n) {
-                Some(first) => {
-                    small_ok += 1;
-                    ring.push((first, n));
-                    if ring.len() >= 32 {
-                        let (old_first, old_n) = ring.remove(0);
-                        heap.release(old_first, old_n);
-                    }
-                }
-                None => {
-                    small_refused += 1;
-                    if let Some((old_first, old_n)) = ring.pop() {
-                        heap.release(old_first, old_n);
-                    }
-                }
-            }
-        }
-        let elapsed = started.elapsed();
-        for (first, n) in ring.into_iter().chain(pinned).chain(tail_pinned) {
-            heap.release(first, n);
-        }
-        println!(
-            "DYNAMIC_BENCH count={} dynamic_cap={} iters={} elapsed_us={} ns_per_iter={} small_ok={} small_refused={} large_refused={}",
-            heap.count(),
-            cap,
-            ITERS,
-            elapsed.as_micros(),
-            elapsed.as_nanos() / ITERS as u128,
-            small_ok,
-            small_refused,
-            large_refused,
-        );
-        assert_eq!(small_ok, ITERS, "small allocations must not be starved by failed large requests");
-        assert_eq!(small_refused, 0);
-        assert_eq!(large_refused, ITERS / 5);
-        assert_eq!(
-            heap.free.load(std::sync::atomic::Ordering::Relaxed),
-            cap,
-            "all dynamic slots must coalesce back cleanly"
-        );
-    }
-
-    /// `DynamicPool` coalesces adjacent releases, ignores duplicate/overlapping
-    /// releases idempotently, and never starves small runs when large runs fail.
-    #[test]
-    fn dynamic_pool_coalescing_idempotent_release_and_no_starvation() {
-        let mut pool = DynamicPool::new(128);
-        let a = pool.alloc(16).unwrap();
-        let b = pool.alloc(32).unwrap();
-        let c = pool.alloc(16).unwrap();
-        let d = pool.alloc(64).unwrap();
-        assert_eq!((a, b, c, d), (0, 16, 48, 64));
-        assert_eq!(pool.free_count, 0);
-        assert_eq!(pool.alloc(1), None);
-
-        // Release a and c (non-adjacent), then b in the middle -> coalesces to [0, 64).
-        assert_eq!(pool.release(a, 16), 16);
-        assert_eq!(pool.release(c, 16), 16);
-        assert_eq!(pool.alloc(32), None, "two 16-slot holes cannot satisfy 32");
-        assert_eq!(pool.alloc(16), Some(c), "exact small-bucket fit still works");
-        assert_eq!(pool.release(c, 16), 16);
-        assert_eq!(pool.release(b, 32), 32);
-        assert_eq!(pool.free_count, 64);
-
-        // Duplicate and partially-overlapping releases are idempotent.
-        assert_eq!(pool.release(a, 16), 0);
-        assert_eq!(pool.release(0, 64), 0);
-        assert_eq!(pool.release(48, 32), 16, "only [64, 80) was still taken");
-        assert_eq!(pool.free_count, 80);
-
-        // Release remainder -> full coalesce back to one 128-slot run.
-        assert_eq!(pool.release(80, 48), 48);
-        assert_eq!(pool.free_count, 128);
-        assert_eq!(pool.by_start.len(), 1);
-        assert_eq!(pool.alloc(128), Some(0));
-    }
-
-    /// View heaps allocate all headroom between the title's count and `null`
-    /// to the dynamic pool instead of wasting already-allocated GPU descriptors.
-    #[test]
-    fn portable_view_heap_uses_full_headroom_up_to_null() {
-        let Some(heap) = HostHeap::new(false, 700_000) else {
-            return; // no host GPU
-        };
-        let null = victory_shader::emit::view_heap_limit();
-        assert!(null > 0);
-        assert_eq!(heap.count(), 700_000);
-        assert_eq!(heap.dynamic, null - 700_000);
-        assert!(heap.dynamic > DYNAMIC, "extra headroom past count must join dynamic pool");
-        assert_eq!(heap.count() + heap.dynamic, null);
-
-        // A title asking for more than the host limit keeps at least `DYNAMIC`.
-        let Some(capped) = HostHeap::new(false, null + 100_000) else {
-            return;
-        };
-        assert_eq!(capped.dynamic, DYNAMIC);
-        assert_eq!(capped.count() + capped.dynamic, null);
     }
 }
