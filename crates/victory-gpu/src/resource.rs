@@ -1358,40 +1358,91 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// Optional explicit cap on title-filled texture host copies, in bytes
+/// (`VICTORY_TEXTURE_BUDGET_MB`).
+#[cfg(windows)]
+fn texture_budget_limit() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    })
+}
+
+/// Exact integer percentage `budget * pct / 100` without overflow or
+/// rounding-down truncation of `budget / 100`.
+#[cfg(windows)]
+fn percent_of(budget: u64, pct: u64) -> u64 {
+    ((u128::from(budget) * u128::from(pct)) / 100) as u64
+}
+
+/// Whether host-copy idle sweeping is enabled (on by default;
+/// `VICTORY_TEXTURE_SWEEP=0` disables it).
+#[cfg(windows)]
+fn sweep_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0"))
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
-/// by this process is under nine tenths of the budget the system gives it
-/// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
-/// limit on those copies' bytes instead). Past the budget the system moves
-/// the card's memory into the PC's, which ended runs 20 and 24.
+/// by this process is under [`room_percent`] of the budget the system gives
+/// it (`VICTORY_TEXTURE_BUDGET_MB` sets a limit on those copies' bytes
+/// instead). Before refusing, tries a safe rate-limited reclaim of unpinned
+/// idle textures and clean idle staging buffers without touching descriptor
+/// heaps or in-flight submissions.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
-    let filled = KINDS[1].load(Relaxed);
-    if let Some(limit) = limit {
-        return filled < limit;
-    }
-    if filled < FLOOR {
+    let limit = texture_budget_limit();
+    let check = || -> bool {
+        let filled = KINDS[1].load(Relaxed);
+        if let Some(limit) = limit {
+            return filled < limit;
+        }
+        if filled < FLOOR {
+            return true;
+        }
+        match crate::host::host().and_then(|h| h.video_memory()) {
+            Some([budget, used, ..]) => budget == 0 || used < percent_of(budget, room_percent()),
+            None => filled < WITHOUT_BUDGET,
+        }
+    };
+    if check() {
         return true;
     }
-    match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
-        None => filled < WITHOUT_BUDGET,
+    // Safe fallback reclaim before refusing: only unpinned idle textures
+    // (`Arc::strong_count == 1 && references == 1`, never touching descriptor
+    // heaps while a GPU submission may be in flight) and clean idle staging
+    // buffers, rate-limited so recording threads do not contend on `TEXTURES`.
+    static LAST_RECLAIM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static RECLAIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    const RECLAIM_EVERY_MS: u64 = 250;
+    let now = crate::host::now_ms();
+    let last = LAST_RECLAIM.load(Relaxed);
+    if now >= last.saturating_add(RECLAIM_EVERY_MS)
+        && LAST_RECLAIM
+            .compare_exchange(last, now, Relaxed, Relaxed)
+            .is_ok()
+        && !RECLAIMING.swap(true, std::sync::atomic::Ordering::Acquire)
+    {
+        let (freed, _) = reclaim_unpinned_idle(1_000, 30);
+        let _ = crate::texture::trim_idle_under_pressure(1_000, 4);
+        RECLAIMING.store(false, std::sync::atomic::Ordering::Release);
+        if freed > 0 {
+            return check();
+        }
     }
+    false
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 75 unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). Leaving ~25%
-/// headroom keeps hot compute/skinning card buffers (which may use up to
+/// textures picked by index are made ([`room`]): 82 unless
+/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). Leaving headroom
+/// keeps hot compute/skinning card buffers (which may use up to
 /// `VICTORY_CARD_VRAM_PERCENT`, default 92%) in local VRAM instead of
 /// spilling onto PCIe shared memory.
 #[cfg(windows)]
@@ -1402,6 +1453,127 @@ fn room_percent() -> u64 {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map_or(82, |percent| percent.clamp(50, 97))
+    })
+}
+
+/// The share of the card's budget, in percent, at which LRU texture eviction
+/// begins: by default 2 percentage points below [`room_percent`] (floor 45)
+/// so eviction always starts before [`room`] refuses new textures, eliminating
+/// any dead-zone regardless of `VICTORY_TEXTURE_ROOM_PERCENT`. Overrideable
+/// via `VICTORY_TEXTURE_EVICT_PERCENT` (45 to 97).
+#[cfg(windows)]
+fn evict_trigger_percent(room_pct: u64) -> u64 {
+    static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let configured = *OVERRIDE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_EVICT_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|p| p.clamp(45, 97))
+    });
+    configured.unwrap_or_else(|| room_pct.saturating_sub(2).max(45))
+}
+
+/// Current VRAM pressure tier relative to [`room_percent`] and
+/// [`evict_trigger_percent`]: `0` normal, `1` preemptive (at or above the
+/// eviction trigger), `2` high (at or above [`room_percent`] or explicit
+/// `VICTORY_TEXTURE_BUDGET_MB`).
+#[cfg(windows)]
+pub(crate) fn vram_pressure_level(video_memory: Option<[u64; 4]>) -> u8 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if let Some(limit) = texture_budget_limit() {
+        let filled = KINDS[1].load(Relaxed);
+        if filled >= limit {
+            return 2;
+        }
+        if filled >= percent_of(limit, 98) {
+            return 1;
+        }
+    }
+    let Some([budget, used, ..]) = video_memory else {
+        return 0;
+    };
+    if budget == 0 {
+        return 0;
+    }
+    let room_pct = room_percent();
+    let trigger_pct = evict_trigger_percent(room_pct);
+    if used >= percent_of(budget, room_pct) {
+        2
+    } else if used >= percent_of(budget, trigger_pct) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Parameters for one LRU texture eviction pass under VRAM pressure.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EvictionPlan {
+    target_bytes: u64,
+    idle_ms: u64,
+    idle_frames: u64,
+    high_pressure: bool,
+}
+
+/// Pure eviction threshold & grace computation for a given `(budget, used)`
+/// and configured `(room_pct, trigger_pct)`.
+///
+/// Aligning `trigger_pct` to `room_pct` (default `room_pct - 2`) eliminates
+/// the dead-zone where `room()` refused new textures above `room_pct` while
+/// eviction previously waited for `max(room_pct, 90)%`. Under high pressure
+/// (`used >= room_pct`), idle grace tightens to 30 frames / 1,000 ms so
+/// 12 GB GPUs reclaim stale textures promptly without touching active frames.
+#[cfg(windows)]
+fn eviction_plan(
+    budget: u64,
+    used: u64,
+    room_pct: u64,
+    trigger_pct: u64,
+    base_idle_ms: u64,
+) -> Option<EvictionPlan> {
+    const MIN_FREE: u64 = 128 << 20;
+    const MAX_FREE: u64 = 512 << 20;
+    const HIGH_IDLE_FRAMES: u64 = 30;
+    const PREEMPT_IDLE_FRAMES: u64 = 60;
+    const MIN_IDLE_MS: u64 = 1_000;
+    const PREEMPT_IDLE_MS: u64 = 2_500;
+
+    if budget == 0 {
+        return None;
+    }
+    let trigger_cap = percent_of(budget, trigger_pct);
+    if used < trigger_cap {
+        return None;
+    }
+    let room_cap = percent_of(budget, room_pct);
+    let high_pressure = used >= room_cap;
+    let goal_pct = room_pct
+        .saturating_sub(8)
+        .min(trigger_pct.saturating_sub(6))
+        .max(40);
+    let goal = percent_of(budget, goal_pct);
+    let min_free = MIN_FREE.min(budget / 16).max(1);
+    let max_free = if used >= budget {
+        MAX_FREE * 2
+    } else {
+        MAX_FREE
+    }
+    .max(min_free);
+    let target_bytes = used.saturating_sub(goal).clamp(min_free, max_free);
+    let (idle_ms, idle_frames) = if high_pressure {
+        (base_idle_ms.min(MIN_IDLE_MS).max(MIN_IDLE_MS), HIGH_IDLE_FRAMES)
+    } else {
+        (
+            base_idle_ms.min(PREEMPT_IDLE_MS).max(MIN_IDLE_MS),
+            PREEMPT_IDLE_FRAMES,
+        )
+    };
+    Some(EvictionPlan {
+        target_bytes,
+        idle_ms,
+        idle_frames,
+        high_pressure,
     })
 }
 
@@ -1640,17 +1812,17 @@ fn evict_enabled() -> bool {
 /// Every caller uses it at once, within the title's call.
 /// Called before a submission starts, by the thread that submits.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
+/// Frees host copies of idle title-filled textures that no list and no
+/// descriptor slot references (`Arc::strong_count == 1 && references == 1`).
+/// Safe to invoke both from `sweep()` and as a rate-limited fallback in
+/// [`room`] because it never modifies descriptor heaps or drops resources
+/// referenced by any list or in-flight submission.
 #[cfg(windows)]
-pub(crate) fn let_go_idle() {
+fn reclaim_unpinned_idle(idle_ms: u64, idle_frames: u64) -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 30;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
-        return;
+    if !sweep_enabled() {
+        return (0, 0);
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
-    // For the trail (`crate::host::trail`): how many went, their bytes,
-    // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
     for &at in all.iter() {
@@ -1663,7 +1835,7 @@ pub(crate) fn let_go_idle() {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -1698,37 +1870,100 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
-    evict_under_vram_pressure(idle_ms);
+    (went, bytes)
 }
 
-/// When VRAM usage exceeds [`room_percent`], unpins the least-recently-used
-/// idle title-filled textures from shader-visible descriptor heaps (replacing
-/// their slots with valid null SRVs) and frees their host copies so hot
-/// compute buffers and newly streamed textures have VRAM headroom.
+#[cfg(windows)]
+pub(crate) fn let_go_idle() {
+    const IDLE_FRAMES: u64 = 30;
+    if !sweep_enabled() {
+        return;
+    }
+    let video = crate::host::host().and_then(|h| h.video_memory());
+    let base_idle_ms = crate::host::vram_idle_ms(video);
+    let pressure = vram_pressure_level(video);
+    // Align idle acceleration to `room_percent()` as well as fixed DXGI tiers
+    // so lower `VICTORY_TEXTURE_ROOM_PERCENT` values (e.g. 60%) do not stall
+    // behind a 5,000 ms timeout while above their configured ceiling.
+    let effective_idle_ms = match pressure {
+        2 => base_idle_ms.min(1_000).max(1_000),
+        1 => base_idle_ms.min(2_500).max(1_000),
+        _ => base_idle_ms,
+    };
+    let _ = reclaim_unpinned_idle(effective_idle_ms, IDLE_FRAMES);
+    evict_under_vram_pressure(video, effective_idle_ms);
+    if pressure >= 1 {
+        let trim_ms = if pressure >= 2 { 1_000 } else { 2_000 };
+        let _ = crate::texture::trim_idle_under_pressure(trim_ms, 4);
+    }
+}
+
+/// When VRAM usage reaches the eviction trigger aligned to [`room_percent`]
+/// (or exceeds `VICTORY_TEXTURE_BUDGET_MB`), unpins the least-recently-used
+/// idle title-filled textures (both placed and committed) from shader-visible
+/// descriptor heaps — replacing their slots with valid null SRVs — and frees
+/// their host copies so hot compute buffers and newly streamed textures have
+/// VRAM headroom.
 /// Called only from [`let_go_idle`] inside `sweep()` when no GPU submission is
 /// in flight.
 #[cfg(windows)]
-fn evict_under_vram_pressure(idle_ms: u64) {
+fn evict_under_vram_pressure(video: Option<[u64; 4]>, base_idle_ms: u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    const EVICT_IDLE_FRAMES: u64 = 120;
-    const MIN_FREE: u64 = 128 << 20;
-    const MAX_FREE: u64 = 512 << 20;
-
     if !evict_enabled() {
         return;
     }
-    let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
+    let room_pct = room_percent();
+    let trigger_pct = evict_trigger_percent(room_pct);
+    let plan = video
+        .and_then(|[budget, used, ..]| {
+            eviction_plan(budget, used, room_pct, trigger_pct, base_idle_ms)
+                .map(|p| (p, budget, used))
+        })
+        .or_else(|| {
+            let limit = texture_budget_limit()?;
+            let filled = KINDS[1].load(Relaxed);
+            eviction_plan(limit, filled, 100, 98, base_idle_ms).map(|p| (p, limit, filled))
+        });
+    let Some((plan, budget, used)) = plan else {
         return;
     };
-    let cap = budget / 100 * room_percent().max(90);
-    if budget == 0 || used < cap {
-        return;
+    let (freed, freed_bytes, slots_cleared) = evict_lru_textures(plan);
+    if freed > 0 {
+        tracing::info!(
+            textures = freed,
+            mb = freed_bytes >> 20,
+            slots_cleared,
+            vram_used_mb = used >> 20,
+            vram_budget_mb = budget >> 20,
+            high_pressure = plan.high_pressure,
+            idle_frames = plan.idle_frames,
+            "VRAM pressure: evicted LRU idle textures from descriptor heaps"
+        );
     }
-    let goal = budget / 100 * room_percent().max(90).saturating_sub(6);
-    let target = used.saturating_sub(goal).clamp(MIN_FREE, MAX_FREE);
+}
 
-    // Pass 1: gather LRU candidates under `TEXTURES` lock, then drop it before
-    // touching descriptor heaps so lock ordering stays strictly acyclic.
+/// Returns whether `last_used` is at least `ms` milliseconds and `frames`
+/// frames before `now` (same packed `(frame << 32) | tenths` layout as
+/// [`crate::host::long_ago`]).
+#[cfg(windows)]
+fn is_idle_at(now: u64, last_used: u64, ms: u64, frames: u64) -> bool {
+    let tenths = (now & 0xffff_ffff).saturating_sub(last_used & 0xffff_ffff);
+    (now >> 32).saturating_sub(last_used >> 32) >= frames && tenths * 100 >= ms
+}
+
+/// Executes one LRU descriptor-unpin + host-copy eviction pass according to
+/// `plan`. Must only run when no GPU submission is in flight.
+#[cfg(windows)]
+fn evict_lru_textures(plan: EvictionPlan) -> (u64, u64, u64) {
+    evict_lru_textures_at(plan, crate::host::moment())
+}
+
+#[cfg(windows)]
+fn evict_lru_textures_at(plan: EvictionPlan, now: u64) -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Pass 1: gather LRU candidates (both placed and committed title-filled
+    // textures) under `TEXTURES` lock, then drop it before touching descriptor
+    // heaps so lock ordering stays strictly acyclic.
     let mut candidates: Vec<(u64, usize, usize, u64)> = {
         let all = textures();
         let mut out = Vec::new();
@@ -1739,7 +1974,7 @@ fn evict_under_vram_pressure(idle_ms: u64) {
                 continue;
             }
             let last_used = r.host.used.load(Relaxed);
-            if !crate::host::long_ago(last_used, idle_ms, EVICT_IDLE_FRAMES) {
+            if !is_idle_at(now, last_used, plan.idle_ms, plan.idle_frames) {
                 continue;
             }
             let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -1754,7 +1989,7 @@ fn evict_under_vram_pressure(idle_ms: u64) {
         out
     };
     if candidates.is_empty() {
-        return;
+        return (0, 0, 0);
     }
     // Oldest `moment()` first (frame in high 32 bits, tenths in low 32 bits).
     candidates.sort_unstable_by_key(|&(last_used, _, _, _)| last_used);
@@ -1766,14 +2001,14 @@ fn evict_under_vram_pressure(idle_ms: u64) {
         victim_ptrs.insert(raw);
         victim_resources.push(at);
         selected += bytes;
-        if selected >= target {
+        if selected >= plan.target_bytes {
             break;
         }
     }
 
     let slots_cleared = crate::descriptor::evict_kept_resources(&victim_ptrs);
     if slots_cleared == 0 {
-        return;
+        return (0, 0, 0);
     }
 
     // Pass 2: now that descriptor heaps released their COM references (and no
@@ -1810,16 +2045,7 @@ fn evict_under_vram_pressure(idle_ms: u64) {
             }
         }
     }
-    if freed > 0 {
-        tracing::info!(
-            textures = freed,
-            mb = freed_bytes >> 20,
-            slots_cleared,
-            vram_used_mb = used >> 20,
-            vram_budget_mb = budget >> 20,
-            "VRAM pressure: evicted LRU idle textures from descriptor heaps"
-        );
-    }
+    (freed, freed_bytes, slots_cleared)
 }
 
 /// For the memory line: title textures with a host copy the host renders
@@ -2705,7 +2931,7 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::slot;
 
@@ -4033,5 +4259,231 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    pub(crate) static SWEEP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(windows)]
+    pub(crate) fn test_committed_texture_2d(width: u64, height: u32, format: u32) -> This {
+        let mut out = std::ptr::null();
+        let desc = texture(width, height, format, 1);
+        assert_eq!(
+            create_committed(
+                std::ptr::null(),
+                &PROPERTIES,
+                0,
+                &desc,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut out,
+            ),
+            S_OK
+        );
+        out
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn test_release_resource(this: This) {
+        assert_eq!(slot::<Release>(this, 0x10)(this), 0);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn test_texture_host_raw(this: This) -> Option<usize> {
+        let r = resource(this);
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        made.as_ref()
+            .map(|(h, _)| windows::core::Interface::as_raw(&h.texture) as usize)
+    }
+
+    /// Eviction plan aligns to `room_percent()` (eliminating the old
+    /// `room_percent()..90%` dead-zone) and tightens grace frames to 30 under
+    /// high pressure (`used >= room_percent()`).
+    #[cfg(windows)]
+    #[test]
+    fn eviction_plan_eliminates_room_to_90_dead_zone() {
+        let gib = 1u64 << 30;
+        let budget = 10 * gib; // ~12 GB GPU DXGI local budget
+
+        // Default room_percent = 82, trigger = 80.
+        assert_eq!(eviction_plan(budget, percent_of(budget, 79), 82, 80, 5_000), None);
+        let preempt = eviction_plan(budget, percent_of(budget, 80), 82, 80, 2_500)
+            .expect("must trigger preemptively at 80%");
+        assert!(!preempt.high_pressure);
+        assert_eq!(preempt.idle_frames, 60);
+        assert_eq!(preempt.idle_ms, 2_500);
+
+        for pct in [82u64, 85, 89] {
+            let plan = eviction_plan(budget, percent_of(budget, pct), 82, 80, 2_500)
+                .unwrap_or_else(|| panic!("must trigger inside old 82-90% dead-zone at {pct}%"));
+            assert!(plan.high_pressure, "pct={pct}");
+            assert_eq!(plan.idle_frames, 30, "pct={pct}");
+            assert_eq!(plan.idle_ms, 1_000, "pct={pct}");
+            assert!(plan.target_bytes >= (128 << 20));
+            assert!(plan.target_bytes <= (512 << 20));
+        }
+
+        // Custom VICTORY_TEXTURE_ROOM_PERCENT=60 (trigger = 58): old dead-zone
+        // spanned 60%..89%.
+        assert_eq!(eviction_plan(budget, percent_of(budget, 57), 60, 58, 5_000), None);
+        let low_preempt = eviction_plan(budget, percent_of(budget, 58), 60, 58, 5_000)
+            .expect("must trigger preemptively at 58%");
+        assert!(!low_preempt.high_pressure);
+        assert_eq!(low_preempt.idle_frames, 60);
+        assert_eq!(low_preempt.idle_ms, 2_500);
+
+        for pct in [60u64, 70, 80, 89] {
+            let plan = eviction_plan(budget, percent_of(budget, pct), 60, 58, 5_000)
+                .unwrap_or_else(|| panic!("must trigger inside old 60-89% dead-zone at {pct}%"));
+            assert!(plan.high_pressure, "pct={pct}");
+            assert_eq!(plan.idle_frames, 30, "pct={pct}");
+            assert_eq!(plan.idle_ms, 1_000, "pct={pct}");
+        }
+
+        // Over-budget emergency expands max free cap to drain spikes quickly.
+        let over = eviction_plan(budget, percent_of(budget, 105), 82, 80, 1_000).unwrap();
+        assert!(over.high_pressure);
+        assert!(over.target_bytes > (512 << 20));
+
+        // Zero budget never triggers.
+        assert_eq!(eviction_plan(0, 100, 82, 80, 1_000), None);
+    }
+
+    /// Real-GPU regression test: eviction triggered inside the old 60–89%
+    /// dead-zone nullifies `HostHeap::kept` slots for both committed and
+    /// placed idle title-filled textures (without touching active textures),
+    /// frees host VRAM without GPU page fault, and cleanly recreates and
+    /// uploads the texture on a subsequent draw.
+    #[cfg(windows)]
+    #[test]
+    fn eviction_in_dead_zone_nullifies_kept_frees_vram_and_recreates_on_draw() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _serial = SWEEP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+
+        // Create a shader-visible view heap registered in `SHADER_HEAPS`.
+        #[repr(C)]
+        struct ExtendedHeapDesc {
+            desc: [u32; 4],
+            placement: [u64; 2],
+        }
+        let heap_desc = ExtendedHeapDesc {
+            desc: [0, 16, 1, 0], // views, 16 slots, SHADER_VISIBLE, node 0
+            placement: [0, 0],
+        };
+        let heap_iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let mut heap_obj = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                (&raw const heap_desc.desc).cast(),
+                &heap_iid,
+                &mut heap_obj,
+            ),
+            S_OK
+        );
+        let heap = crate::descriptor::heap(heap_obj);
+        let host_heap = heap.host().expect("host view heap");
+
+        // 1) Committed idle title-filled texture.
+        let committed_idle = test_committed_texture_2d(256, 256, 28);
+        // 2) Placed idle title-filled texture (static backing so `PLACED_TEXTURES`
+        //    entry remains valid for the rest of the test binary).
+        static PLACED_BACKING: [u8; 64 * 64 * 4] = [0x3cu8; 64 * 64 * 4];
+        let placed_desc = texture(64, 64, 28, 1);
+        // SAFETY: `ResourceDesc` is 56 bytes (14 u32 words).
+        let placed_words: [u32; 14] = unsafe { std::mem::transmute(placed_desc) };
+        let placed_idle =
+            texture_at(PLACED_BACKING.as_ptr() as u64, &placed_words).expect("placed texture");
+        // 3) Committed active-frame texture (must NOT be evicted).
+        let active_tex = test_committed_texture_2d(256, 256, 28);
+
+        // Pin all three in shader-visible descriptor heap slots 0, 1, 2.
+        for (slot_idx, res) in [(0u32, committed_idle), (1, placed_idle), (2, active_tex)] {
+            let handle = heap.handle(slot_idx).unwrap();
+            crate::descriptor::create_srv(std::ptr::null(), res, std::ptr::null(), handle);
+            assert!(host_heap.mirror(slot_idx, handle, true).is_some());
+            let host_tex = host_resource(res).expect("host copy created");
+            assert!(
+                crate::host::references(host_tex) > 1,
+                "slot {slot_idx} must pin host texture in kept"
+            );
+        }
+
+        let committed_bytes = resource(committed_idle)
+            .host
+            .made
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .0
+            .bytes;
+        let placed_bytes = resource(placed_idle)
+            .host
+            .made
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .0
+            .bytes;
+
+        // Backdate idle textures to 100 frames / 10 s ago; keep active texture fresh.
+        let now = (200u64 << 32) | 500;
+        let old_moment = (100u64 << 32) | 400;
+        let fresh_moment = (195u64 << 32) | 495;
+        resource(committed_idle).host.used.store(old_moment, Relaxed);
+        resource(placed_idle).host.used.store(old_moment, Relaxed);
+        resource(active_tex).host.used.store(fresh_moment, Relaxed);
+
+        // Trigger eviction inside the old 82-90% dead-zone (85% of 10 GiB budget).
+        let budget = 10u64 << 30;
+        let plan = eviction_plan(budget, percent_of(budget, 85), 82, 80, 2_500)
+            .expect("eviction must trigger at 85% (old dead-zone)");
+        assert!(plan.high_pressure);
+        assert_eq!(plan.idle_frames, 30);
+
+        let (freed, freed_bytes, slots_cleared) = evict_lru_textures_at(plan, now);
+        assert!(slots_cleared >= 2, "expected >= 2 kept slots cleared, got {slots_cleared}");
+        assert!(freed >= 2, "expected >= 2 evicted textures, got {freed}");
+        assert!(
+            freed_bytes >= committed_bytes + placed_bytes,
+            "expected >= {} bytes freed, got {freed_bytes}",
+            committed_bytes + placed_bytes
+        );
+
+        // Both idle textures (committed and placed) were evicted; active was untouched.
+        assert!(resource(committed_idle).host.made.lock().unwrap().is_none());
+        assert!(resource(committed_idle).host.gone.load(Relaxed));
+        assert!(resource(placed_idle).host.made.lock().unwrap().is_none());
+        assert!(resource(placed_idle).host.gone.load(Relaxed));
+        assert!(resource(active_tex).host.made.lock().unwrap().is_some());
+        assert!(!resource(active_tex).host.gone.load(Relaxed));
+
+        // Subsequent draw: re-mirror slot 0, recreate host texture, upload & execute on GPU.
+        let handle0 = heap.handle(0).unwrap();
+        assert!(host_heap.mirror(0, handle0, true).is_some());
+        let recreated = host_resource(committed_idle).expect("texture must recreate cleanly");
+        assert!(crate::host::references(recreated) > 1);
+        let list = host.new_list().expect("host command list");
+        crate::texture::upload(&list, committed_idle, recreated);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: plain device health query (catches page faults / D3D12 debug errors).
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        drop(list);
+        assert_eq!(slot::<Release>(heap_obj, 0x10)(heap_obj), 0);
+        test_release_resource(committed_idle);
+        test_release_resource(active_tex);
     }
 }

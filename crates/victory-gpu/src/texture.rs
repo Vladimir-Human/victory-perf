@@ -424,41 +424,152 @@ pub(crate) fn let_go() -> [u64; 2] {
     [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
 }
 
+/// Whether pressure-driven trimming of clean uploaded staging buffers is
+/// enabled (on by default; `VICTORY_STAGING_TRIM=0` disables it).
+fn trim_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_TRIM").is_none_or(|v| v != "0"))
+}
+
+/// Current staging buffer count and bytes from `STAGED` (for tests).
+#[cfg(test)]
+pub(crate) fn staged_accounting() -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed)]
+}
+
+/// Returns whether `last_used` is at least `ms` milliseconds and `frames`
+/// frames before `now` (same packed `(frame << 32) | tenths` layout as
+/// [`crate::host::long_ago`]).
+fn is_idle_at(now: u64, last_used: u64, ms: u64, frames: u64) -> bool {
+    let tenths = (now & 0xffff_ffff).saturating_sub(last_used & 0xffff_ffff);
+    (now >> 32).saturating_sub(last_used >> 32) >= frames && tenths * 100 >= ms
+}
+
+/// Releases idle, already-uploaded, clean (`uploaded && !dirty`) `Staging`
+/// COM upload buffers that are held by no command list (recorded or in-flight)
+/// while leaving each texture's host GPU copy intact. Dropping the removed
+/// `Staging` entries updates `STAGED` accounting automatically via `Drop`; if
+/// the title later samples or updates the texture again, [`staging`] creates a
+/// fresh upload buffer and re-detiles cleanly.
+pub(crate) fn trim_idle_under_pressure(idle_ms: u64, idle_frames: u64) -> (u64, u64) {
+    trim_idle_under_pressure_at(idle_ms, idle_frames, crate::host::moment())
+}
+
+fn trim_idle_under_pressure_at(idle_ms: u64, idle_frames: u64, now: u64) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !trim_enabled() {
+        return (0, 0);
+    }
+    let mut dropped: Vec<Arc<Staging>> = Vec::new();
+    let (mut went, mut bytes) = (0u64, 0u64);
+    {
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = map.as_mut() else {
+            return (0, 0);
+        };
+        if map.is_empty() {
+            return (0, 0);
+        }
+        let mut keys = Vec::new();
+        for (&key, s) in map.iter() {
+            let clean = s.uploaded.load(Relaxed) && !s.dirty.load(Relaxed);
+            if clean
+                && Arc::strong_count(s) == 1
+                && crate::host::references(&s.buffer) == 1
+                && is_idle_at(now, s.used.load(Relaxed), idle_ms, idle_frames)
+            {
+                keys.push(key);
+            }
+        }
+        for key in keys {
+            if let Some(s) = map.remove(&key) {
+                LET_GO[0].fetch_add(1, Relaxed);
+                LET_GO[1].fetch_add(s.bytes, Relaxed);
+                went += 1;
+                bytes += s.bytes;
+                dropped.push(s);
+            }
+        }
+    }
+    // Drop/retire outside `STAGING` lock so COM destruction never blocks
+    // concurrent texture uploads and `STAGED` decrements immediately when no
+    // submission is in flight.
+    for s in dropped {
+        crate::host::retire(s);
+    }
+    if went > 0 {
+        crate::host::trail(|| {
+            format!(
+                "pressure trim: {went} clean uploaded staging buffers released ({} KiB), host textures kept",
+                bytes >> 10
+            )
+        });
+    }
+    (went, bytes)
+}
+
 /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
 /// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
 /// texture, kept so that an unchanged texture is not uploaded again, and
 /// those of textures no longer sampled were kept for the run (2,246 of
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
 /// texture makes a staging buffer anew, detiles and uploads once more.
+/// Under VRAM pressure or low physical RAM, additionally trims clean uploaded
+/// staging buffers on a tighter idle window while preserving dirty/unflushed
+/// buffers.
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = map.as_mut() else {
-        return;
-    };
-    if map.is_empty() {
-        return;
-    }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let avail_phys = crate::host::available_physical_ram();
+    let idle_ms = crate::host::ram_idle_ms(avail_phys);
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
+    let mut dropped: Vec<Arc<Staging>> = Vec::new();
     let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
-        if !keep {
-            LET_GO[0].fetch_add(1, Relaxed);
-            LET_GO[1].fetch_add(s.bytes, Relaxed);
-            went += 1;
-            bytes += s.bytes;
+    {
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = map.as_mut() else {
+            return;
+        };
+        if map.is_empty() {
+            return;
         }
-        keep
-    });
+        let mut keys = Vec::new();
+        for (&key, s) in map.iter() {
+            if Arc::strong_count(s) == 1
+                && crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+            {
+                keys.push(key);
+            }
+        }
+        for key in keys {
+            if let Some(s) = map.remove(&key) {
+                LET_GO[0].fetch_add(1, Relaxed);
+                LET_GO[1].fetch_add(s.bytes, Relaxed);
+                went += 1;
+                bytes += s.bytes;
+                dropped.push(s);
+            }
+        }
+    }
+    for s in dropped {
+        crate::host::retire(s);
+    }
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+    }
+    let vram_pressure =
+        crate::resource::vram_pressure_level(crate::host::host().and_then(|h| h.video_memory()));
+    let high_ram_pressure = avail_phys.is_some_and(|avail| avail < 2 * GIB);
+    let mod_ram_pressure = avail_phys.is_some_and(|avail| avail < 4 * GIB);
+    if vram_pressure >= 2 || high_ram_pressure {
+        let _ = trim_idle_under_pressure(1_000, IDLE_FRAMES);
+    } else if vram_pressure >= 1 || mod_ram_pressure {
+        let _ = trim_idle_under_pressure(2_000, IDLE_FRAMES);
     }
 }
 
@@ -1451,5 +1562,143 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod staging_trim_tests {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// Pressure trim releases clean (`uploaded && !dirty`), non-in-flight idle
+    /// `Staging` upload buffers, updates `STAGED` accounting, keeps the host
+    /// GPU texture intact, never drops dirty or in-flight staging buffers, and
+    /// seamlessly recreates + re-detiles `Staging` on a subsequent upload.
+    #[test]
+    fn pressure_trim_releases_clean_idle_staging_keeps_dirty_and_reuploads_cleanly() {
+        let _serial = crate::resource::tests::SWEEP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+
+        let clean_idle = crate::resource::tests::test_committed_texture_2d(64, 64, 28);
+        let dirty_idle = crate::resource::tests::test_committed_texture_2d(64, 64, 28);
+        let in_flight_clean = crate::resource::tests::test_committed_texture_2d(64, 64, 28);
+
+        let fill_memory = |res: crate::object::This, byte: u8| {
+            let (ptr, desc) = crate::resource::texture_memory(res).unwrap();
+            let size = crate::resource::texture_layout(&desc).unwrap().size as usize;
+            // SAFETY: committed resource memory owned exclusively by this test.
+            unsafe { std::ptr::write_bytes(ptr.cast_mut(), byte, size) };
+        };
+        fill_memory(clean_idle, 0x2a);
+        fill_memory(dirty_idle, 0x4b);
+        fill_memory(in_flight_clean, 0x6c);
+
+        // First submission: creates Staging buffers and runs initial detile + copy.
+        {
+            let list = host.new_list().expect("list 1");
+            for res in [clean_idle, dirty_idle, in_flight_clean] {
+                let tex = crate::resource::host_resource(res).unwrap();
+                super::upload(&list, res, tex);
+            }
+            list.close();
+            host.execute(&[&list]);
+        }
+        // Second submission for `clean_idle` and `in_flight_clean` (unchanged
+        // memory): marks them `uploaded = true, dirty = false`, while
+        // `dirty_idle` stays `dirty = true`.
+        {
+            let list = host.new_list().expect("list 2");
+            for res in [clean_idle, in_flight_clean] {
+                let tex = crate::resource::host_resource(res).unwrap();
+                super::upload(&list, res, tex);
+            }
+            list.close();
+            host.execute(&[&list]);
+        }
+
+        // Verify clean vs dirty state before trimming.
+        {
+            let map = super::STAGING.lock().unwrap();
+            let map = map.as_ref().unwrap();
+            let s_clean = map.get(&(clean_idle as usize)).unwrap();
+            let s_dirty = map.get(&(dirty_idle as usize)).unwrap();
+            let s_flight = map.get(&(in_flight_clean as usize)).unwrap();
+            assert!(s_clean.uploaded.load(Relaxed) && !s_clean.dirty.load(Relaxed));
+            assert!(s_dirty.dirty.load(Relaxed));
+            assert!(s_flight.uploaded.load(Relaxed) && !s_flight.dirty.load(Relaxed));
+        }
+
+        // Hold an open command list referencing `in_flight_clean` (`Arc::strong_count > 1`).
+        let held_list = host.new_list().expect("held list");
+        let tex_flight = crate::resource::host_resource(in_flight_clean).unwrap();
+        super::upload(&held_list, in_flight_clean, tex_flight);
+
+        let clean_bytes = {
+            let map = super::STAGING.lock().unwrap();
+            let map = map.as_ref().unwrap();
+            let old_moment = (10u64 << 32) | 100;
+            for res in [clean_idle, dirty_idle, in_flight_clean] {
+                map.get(&(res as usize))
+                    .unwrap()
+                    .used
+                    .store(old_moment, Relaxed);
+            }
+            map.get(&(clean_idle as usize)).unwrap().bytes
+        };
+        let host_raw_before = crate::resource::tests::test_texture_host_raw(clean_idle);
+        assert!(host_raw_before.is_some());
+        let [staged_count_before, staged_bytes_before] = super::staged_accounting();
+
+        // Trigger pressure trim well past idle grace.
+        let now = (100u64 << 32) | 300;
+        let (trimmed, trimmed_bytes) = super::trim_idle_under_pressure_at(1_000, 4, now);
+        assert!(trimmed >= 1, "expected clean_idle to be trimmed");
+        assert!(trimmed_bytes >= clean_bytes);
+
+        let [staged_count_after, staged_bytes_after] = super::staged_accounting();
+        assert!(
+            staged_count_after < staged_count_before,
+            "STAGED count must drop after trim ({staged_count_before} -> {staged_count_after})"
+        );
+        assert!(
+            staged_bytes_after <= staged_bytes_before.saturating_sub(clean_bytes),
+            "STAGED bytes must drop by at least {clean_bytes} ({staged_bytes_before} -> {staged_bytes_after})"
+        );
+
+        // `clean_idle` staging released while host GPU texture remains intact.
+        assert!(!super::is_staged(clean_idle));
+        assert_eq!(
+            crate::resource::tests::test_texture_host_raw(clean_idle),
+            host_raw_before,
+            "host GPU texture must remain intact when staging buffer is trimmed"
+        );
+        // `dirty_idle` and `in_flight_clean` MUST NOT be dropped.
+        assert!(super::is_staged(dirty_idle), "dirty unflushed staging must not be dropped");
+        assert!(
+            super::is_staged(in_flight_clean),
+            "staging referenced by a command list must not be dropped"
+        );
+
+        // Subsequent write + upload seamlessly recreates Staging and re-detiles cleanly.
+        fill_memory(clean_idle, 0x9e);
+        {
+            let list = host.new_list().expect("reupload list");
+            let tex = crate::resource::host_resource(clean_idle).unwrap();
+            super::upload(&list, clean_idle, tex);
+            list.close();
+            host.execute(&[&list]);
+        }
+        assert!(super::is_staged(clean_idle), "Staging must be recreated on next upload");
+        assert!(super::staged_accounting()[1] >= staged_bytes_after + clean_bytes);
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        drop(held_list);
+        crate::resource::tests::test_release_resource(clean_idle);
+        crate::resource::tests::test_release_resource(dirty_idle);
+        crate::resource::tests::test_release_resource(in_flight_clean);
     }
 }
