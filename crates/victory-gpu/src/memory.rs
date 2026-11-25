@@ -72,6 +72,10 @@ struct Memory {
     slot_epoch: Vec<u64>,
     /// Frame at which a copy slot's page count dropped to 0 (`u64::MAX` while live).
     slot_retired_frame: Vec<u64>,
+    /// Heaps (by address) that have written `null_raw_uav_at` to a retired
+    /// slot after its last live use, making it safe to recycle without leaving
+    /// a stale resource UAV in another heap.
+    slot_cleared_heaps: Vec<Vec<usize>>,
     /// Global epoch incremented whenever a copy slot is allocated, replaced, or revived.
     epoch: u64,
     /// Per host view heap (by address): `(base_slot, synced_epoch)`.
@@ -217,20 +221,77 @@ fn find_page_shadow(start: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
-/// Selects a copy slot to hold a new shadow: reuses an existing slot if
-/// already present, appends while under `COPIES`, or recycles a retired slot
-/// whose page count has been zero for at least [`RETIRE_DELAY_FRAMES`] frames.
+/// Writes the raw UAV for copy `slot` (`base + 1 + slot`) into `heap`,
+/// sizing the view past any in-place placement bias so offset 0 covers the
+/// full `[bias, bias + len)` span.
+fn write_copy_uav(heap: &HostHeap, base: u32, slot: usize, shadow: &Shadow) {
+    let (first, len) = shadow.span();
+    let view_len = shadow.offset(first).saturating_add(len);
+    heap.raw_uav_at(base + 1 + slot as u32, &shadow.buffer, 0, view_len);
+}
+
+/// Decides whether eager sibling-page population in [`Memory::map`] may claim
+/// `other_page` (currently mapped to `cur_copy`) for `new_copy`.
+///
+/// - Empty pages (`cur_copy == 0`): buffers always claim; loose windows skip
+///   pages overlapping any active registered buffer.
+/// - Occupied pages (`cur_copy != 0 && cur_copy != new_copy`):
+///   - Registered buffers (`is_buffer`) supersede loose windows / unregistered
+///     stale copies, and on `revalidate` also supersede the previous copy
+///     `existing` across all sibling pages.
+///   - Loose windows (`!is_buffer`) supersede `existing` on `revalidate` when
+///     the sibling page does not overlap any active registered buffer (e.g.
+///     after `in_place_let_go`, tail growth, or buffer `unregister`), preventing
+///     directory split-brain and letting `existing` retire cleanly.
+#[allow(clippy::too_many_arguments)]
+fn can_claim_sibling_page(
+    cur_copy: u32,
+    new_copy: u32,
+    existing: u32,
+    revalidate: bool,
+    is_buffer: bool,
+    cur_is_registered_buffer: bool,
+    overlaps_registered_buffer: bool,
+) -> bool {
+    if cur_copy == 0 {
+        is_buffer || !overlaps_registered_buffer
+    } else if cur_copy == new_copy {
+        false
+    } else if is_buffer {
+        !cur_is_registered_buffer || (revalidate && cur_copy == existing)
+    } else {
+        revalidate && cur_copy == existing && !overlaps_registered_buffer
+    }
+}
+
+/// Selects a copy slot to hold a new shadow: appends while under `COPIES`, or
+/// recycles a retired slot whose page count has been zero for more than
+/// [`RETIRE_DELAY_FRAMES`] frames AND whose descriptor has already been
+/// cleared to `null_raw_uav_at` in every other known view heap.
 fn select_copy_slot(
     copies_len: usize,
     copy_pages: &[u32],
     slot_retired_frame: &[u64],
+    slot_cleared_heaps: &[Vec<usize>],
+    known_heaps: &HashMap<usize, (u32, u64)>,
+    current_heap: usize,
     frame: u64,
 ) -> Option<(usize, bool)> {
     if copies_len < COPIES as usize {
         return Some((copies_len, false));
     }
-    for (n, (&pages, &retired_at)) in copy_pages.iter().zip(slot_retired_frame).enumerate() {
-        if pages == 0 && frame.saturating_sub(retired_at) > RETIRE_DELAY_FRAMES {
+    for (n, ((&pages, &retired_at), cleared)) in copy_pages
+        .iter()
+        .zip(slot_retired_frame)
+        .zip(slot_cleared_heaps)
+        .enumerate()
+    {
+        if pages == 0
+            && frame.saturating_sub(retired_at) > RETIRE_DELAY_FRAMES
+            && known_heaps
+                .keys()
+                .all(|&h| h == current_heap || cleared.contains(&h))
+        {
             return Some((n, true));
         }
     }
@@ -257,6 +318,7 @@ impl Memory {
             copy_pages: Vec::new(),
             slot_epoch: Vec::new(),
             slot_retired_frame: Vec::new(),
+            slot_cleared_heaps: Vec::new(),
             epoch: 0,
             heaps: HashMap::new(),
             lists: HashMap::new(),
@@ -267,14 +329,16 @@ impl Memory {
 
     /// Registers `shadow` in `self.copies` (or returns its existing slot),
     /// returning `(slot_index, is_newly_assigned_or_revived)`.
-    fn ensure_slot(&mut self, shadow: &Arc<Shadow>) -> Option<(usize, bool)> {
+    fn ensure_slot(&mut self, shadow: &Arc<Shadow>, current_heap: usize) -> Option<(usize, bool)> {
         if let Some(n) = self.copies.iter().position(|c| Arc::ptr_eq(c, shadow)) {
             if self.copy_pages[n] == 0 {
                 // Reviving a previously retired slot: bump epoch so command
-                // lists that skipped it while retired refresh/write-track it.
+                // lists that skipped it while retired refresh/write-track it
+                // and heaps restore its UAV before directory publication.
                 self.epoch = self.epoch.wrapping_add(1).max(1);
                 self.slot_epoch[n] = self.epoch;
                 self.slot_retired_frame[n] = u64::MAX;
+                self.slot_cleared_heaps[n].clear();
                 return Some((n, true));
             }
             return Some((n, false));
@@ -283,6 +347,9 @@ impl Memory {
             self.copies.len(),
             &self.copy_pages,
             &self.slot_retired_frame,
+            &self.slot_cleared_heaps,
+            &self.heaps,
+            current_heap,
             self.frame,
         ) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -300,11 +367,13 @@ impl Memory {
             self.copy_pages[slot] = 0;
             self.slot_epoch[slot] = self.epoch;
             self.slot_retired_frame[slot] = u64::MAX;
+            self.slot_cleared_heaps[slot].clear();
         } else {
             self.copies.push(shadow.clone());
             self.copy_pages.push(0);
             self.slot_epoch.push(self.epoch);
             self.slot_retired_frame.push(u64::MAX);
+            self.slot_cleared_heaps.push(Vec::new());
         }
         Some((slot, true))
     }
@@ -332,6 +401,7 @@ impl Memory {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     self.slot_retired_frame[old_slot] = self.frame;
+                    self.slot_cleared_heaps[old_slot].clear();
                 }
             }
         }
@@ -345,7 +415,11 @@ impl Memory {
     /// `revalidate` is true and the page's active `Shadow` changed, e.g. a
     /// title buffer was registered inside a loose window or reallocated after
     /// `unregister`/`in_place_let_go`) and the memory is the title's.
-    fn map(&mut self, address: u64, revalidate: bool) {
+    ///
+    /// Writes `heap`'s raw UAV descriptor (with a `Release` fence) before
+    /// publishing `(slot + 1, offset)` into `self.directory` so concurrent GPU
+    /// work never observes a directory entry ahead of its heap descriptor.
+    fn map(&mut self, heap: &HostHeap, base: u32, heap_key: usize, address: u64, revalidate: bool) {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
@@ -384,23 +458,27 @@ impl Memory {
         let Some(start_offset) = page_buffer_offset(&shadow, start) else {
             return;
         };
-        let Some((n, fresh_slot)) = self.ensure_slot(&shadow) else {
+        let Some((n, fresh_slot)) = self.ensure_slot(&shadow, heap_key) else {
             return;
         };
+        if fresh_slot {
+            // Publish the heap's raw UAV descriptor before exposing `n + 1` in
+            // the GPU-visible directory.
+            write_copy_uav(heap, base, n, &shadow);
+            fence(Ordering::Release);
+        }
         self.assign_page(page, n, start_offset);
 
-        // Eagerly fill the remaining full pages of a newly registered copy so
-        // multi-page BVH structures do not fault page by page. When `shadow`
-        // is a loose window, never overwrite pages belonging to a registered
-        // title buffer inside that window (otherwise root-UAV writes to the
-        // buffer and raw-address reads through the window alias different GPU
-        // copies).
+        // Eagerly fill the remaining full pages of a newly registered copy (or
+        // revalidated replacement) so multi-page BVH structures do not fault
+        // page by page and superseded copies retire cleanly without split-brain.
         if fresh_slot || (existing != 0 && revalidate) {
             let (first, len) = shadow.span();
             let (buffers, merged_buffers) = registered_buffer_spans();
             let is_buffer = buffers
                 .binary_search(&(first, first.saturating_add(len)))
                 .is_ok();
+            let new_copy = n as u32 + 1;
             let mut at = first.next_multiple_of(PAGE);
             while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
                 let other_page = at / PAGE;
@@ -409,26 +487,21 @@ impl Memory {
                     let other = unsafe { self.directory.1.add(other_page as usize * 2) };
                     // SAFETY: as above.
                     let cur_copy = unsafe { other.read() };
-                    let can_claim = if cur_copy == 0 {
-                        // A loose window must not claim pages covered by a
-                        // registered title buffer.
-                        is_buffer || !overlaps_any_buffer(at, &merged_buffers)
-                    } else if is_buffer && cur_copy != n as u32 + 1 {
-                        // A registered title buffer always supersedes a loose
-                        // window or unregistered stale copy on its pages, and
-                        // on revalidation supersedes an older replaced copy on
-                        // sibling pages too.
-                        let cur_not_registered_buffer =
-                            self.copies.get((cur_copy - 1) as usize).is_some_and(|c| {
-                                let (cf, cl) = c.span();
-                                buffers.binary_search(&(cf, cf.saturating_add(cl))).is_err()
-                            });
-                        cur_not_registered_buffer || (revalidate && cur_copy == existing)
-                    } else {
-                        false
-                    };
-                    if can_claim
-                        && let Some(off) = page_buffer_offset(&shadow, at)
+                    let cur_is_registered_buffer = cur_copy != 0
+                        && self.copies.get((cur_copy - 1) as usize).is_some_and(|c| {
+                            let (cf, cl) = c.span();
+                            buffers.binary_search(&(cf, cf.saturating_add(cl))).is_ok()
+                        });
+                    let overlaps_buf = (!is_buffer) && overlaps_any_buffer(at, &merged_buffers);
+                    if can_claim_sibling_page(
+                        cur_copy,
+                        new_copy,
+                        existing,
+                        revalidate,
+                        is_buffer,
+                        cur_is_registered_buffer,
+                        overlaps_buf,
+                    ) && let Some(off) = page_buffer_offset(&shadow, at)
                     {
                         self.assign_page(other_page, n, off);
                     }
@@ -440,7 +513,7 @@ impl Memory {
 
     /// The pages shaders found empty since the last drain. Uses 64-bit loads
     /// to scan the 16 KiB fault table in <1 us on write-back shared memory.
-    fn take_faults(&mut self) {
+    fn take_faults(&mut self, heap: &HostHeap, base: u32, heap_key: usize) {
         let mut pages = Vec::new();
         // Dword 0 is the unused sink; scan slot 1 alone, then 2-dword aligned
         // pairs `(2, 3), (4, 5), ...` up to `MEMORY_FAULTS`.
@@ -500,16 +573,16 @@ impl Memory {
             }
         }
         for page in pages {
-            self.map(u64::from(page) * PAGE, false);
+            self.map(heap, base, heap_key, u64::from(page) * PAGE, false);
         }
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it.
-    fn name(&mut self, address: u64, revalidate: bool) {
-        self.map(address, revalidate);
+    fn name(&mut self, heap: &HostHeap, base: u32, heap_key: usize, address: u64, revalidate: bool) {
+        self.map(heap, base, heap_key, address, revalidate);
         if let Some(next) = (address & !(CELL - 1)).checked_add(CELL) {
-            self.map(next, false);
+            self.map(heap, base, heap_key, next, false);
         }
     }
 }
@@ -533,7 +606,59 @@ pub(crate) fn ready(
     }
     let m = guard.as_mut()?;
     let frame = crate::frame::current();
-    // Once per list reset: reset per-list generation watermarks and keep the
+    let key = std::ptr::from_ref(heap) as usize;
+    // Allocate and initialize `heap`'s dynamic copy run BEFORE mutating
+    // `directory`, `copies`, or `faults`: an allocation failure leaves shared
+    // state untouched, every unpopulated slot starts as a valid `null_raw_uav`,
+    // and existing copies/quiescent retirements are synchronized up front.
+    let base = match m.heaps.get(&key).copied() {
+        None => {
+            // Held for the heap's life: not given back with a list's slots.
+            let base = heap.dynamic(COPIES + 1)?;
+            for s in 0..=COPIES {
+                heap.null_raw_uav_at(base + s);
+            }
+            for (n, shadow) in m.copies.iter().enumerate() {
+                if m.copy_pages[n] > 0 {
+                    write_copy_uav(heap, base, n, shadow);
+                } else if !m.slot_cleared_heaps[n].contains(&key) {
+                    m.slot_cleared_heaps[n].push(key);
+                }
+            }
+            fence(Ordering::Release);
+            m.heaps.insert(key, (base, m.epoch));
+            base
+        }
+        Some((base, synced_epoch)) => {
+            let mut wrote_uav = false;
+            if synced_epoch < m.epoch {
+                for (n, shadow) in m.copies.iter().enumerate() {
+                    if m.slot_epoch[n] > synced_epoch && m.copy_pages[n] > 0 {
+                        write_copy_uav(heap, base, n, shadow);
+                        wrote_uav = true;
+                    }
+                }
+            }
+            // Clear quiescent retired slots back to null raw UAVs so multi-heap
+            // recycling never leaves a stale resource descriptor behind.
+            for n in 0..m.copies.len() {
+                if m.copy_pages[n] == 0
+                    && frame.saturating_sub(m.slot_retired_frame[n]) > RETIRE_DELAY_FRAMES
+                    && !m.slot_cleared_heaps[n].contains(&key)
+                {
+                    heap.null_raw_uav_at(base + 1 + n as u32);
+                    m.slot_cleared_heaps[n].push(key);
+                    wrote_uav = true;
+                }
+            }
+            if wrote_uav {
+                fence(Ordering::Release);
+            }
+            m.heaps.insert(key, (base, m.epoch));
+            base
+        }
+    };
+    // Once per list reset: reset per-list epoch watermarks and keep the
     // directory/fault buffers alive for the list's lifetime.
     const READ: usize = usize::MAX - 0x6d;
     let first_read = list.first_use(READ);
@@ -545,41 +670,20 @@ pub(crate) fn ready(
             .retain(|_, s| frame.saturating_sub(s.frame) <= 16);
     }
     if new_frame || first_read {
-        m.take_faults();
+        m.take_faults(heap, base, key);
     }
     // Root-view addresses revalidate existing directory entries so a newly
     // registered or reallocated title buffer immediately supersedes a loose
     // window or stale copy covering the same pages.
     for &address in addresses {
-        m.name(address, true);
+        m.name(heap, base, key, address, true);
     }
     for address in extract_constant_addresses(constants) {
-        m.name(address, false);
+        m.name(heap, base, key, address, false);
     }
-    let key = std::ptr::from_ref(heap) as usize;
-    let (base, synced_epoch) = match m.heaps.get(&key) {
-        Some(&run) => run,
-        None => {
-            // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
-            heap.null_raw_uav_at(base);
-            (base, 0)
-        }
-    };
-    if synced_epoch < m.epoch {
-        for (n, shadow) in m.copies.iter().enumerate() {
-            if m.slot_epoch[n] > synced_epoch {
-                let (first, len) = shadow.span();
-                // Account for any in-place placement bias so the raw UAV from
-                // offset 0 covers every byte up to `bias + len`.
-                let view_len = shadow.offset(first).saturating_add(len);
-                heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, view_len);
-            }
-        }
-        m.heaps.insert(key, (base, m.epoch));
-    } else if !m.heaps.contains_key(&key) {
-        m.heaps.insert(key, (base, m.epoch));
-    }
+    // Every slot allocated/recycled/revived above already had `write_copy_uav`
+    // + `Release` fence run on `heap` before directory publication.
+    m.heaps.insert(key, (base, m.epoch));
     let list_key = std::ptr::from_ref(list) as usize;
     let entry = m.lists.entry(list_key).or_default();
     if first_read {
@@ -675,30 +779,136 @@ mod tests {
     }
 
     #[test]
-    fn select_copy_slot_recycles_only_after_retire_delay() {
+    fn select_copy_slot_recycles_only_after_retire_delay_and_other_heaps_clear() {
+        let mut heaps = HashMap::new();
+        heaps.insert(0x1000usize, (0u32, 1u64));
+        let empty_cleared = vec![Vec::new(); 10];
         // Under capacity: appends directly.
-        assert_eq!(select_copy_slot(10, &[1; 10], &[u64::MAX; 10], 50), Some((10, false)));
+        assert_eq!(
+            select_copy_slot(10, &[1; 10], &[u64::MAX; 10], &empty_cleared, &heaps, 0x1000, 50),
+            Some((10, false))
+        );
 
-        // At full capacity with one retired slot at frame 100:
+        // At full capacity with one retired slot at frame 100 (single heap):
         let mut pages = vec![1u32; COPIES as usize];
         let mut retired = vec![u64::MAX; COPIES as usize];
+        let mut cleared = vec![Vec::new(); COPIES as usize];
         pages[7] = 0;
         retired[7] = 100;
         // Too soon (in-flight lists could still reference slot 7): refused.
-        assert_eq!(
-            select_copy_slot(COPIES as usize, &pages, &retired, 100 + RETIRE_DELAY_FRAMES),
-            None
-        );
-        // After retire delay: cleanly recycled.
         assert_eq!(
             select_copy_slot(
                 COPIES as usize,
                 &pages,
                 &retired,
-                100 + RETIRE_DELAY_FRAMES + 1
+                &cleared,
+                &heaps,
+                0x1000,
+                100 + RETIRE_DELAY_FRAMES,
+            ),
+            None
+        );
+        // After retire delay on single heap: cleanly recycled.
+        assert_eq!(
+            select_copy_slot(
+                COPIES as usize,
+                &pages,
+                &retired,
+                &cleared,
+                &heaps,
+                0x1000,
+                100 + RETIRE_DELAY_FRAMES + 1,
             ),
             Some((7, true))
         );
+
+        // Multi-heap guard: when a second heap exists and has NOT yet cleared
+        // slot 7 back to `null_raw_uav_at`, recycling stays blocked even past
+        // the retire delay so the second heap cannot alias the old UAV.
+        heaps.insert(0x2000usize, (257u32, 1u64));
+        assert_eq!(
+            select_copy_slot(
+                COPIES as usize,
+                &pages,
+                &retired,
+                &cleared,
+                &heaps,
+                0x1000,
+                100 + RETIRE_DELAY_FRAMES + 1,
+            ),
+            None
+        );
+        // Once the other heap clears slot 7 to `null_raw_uav_at`, recycling is permitted.
+        cleared[7].push(0x2000usize);
+        assert_eq!(
+            select_copy_slot(
+                COPIES as usize,
+                &pages,
+                &retired,
+                &cleared,
+                &heaps,
+                0x1000,
+                100 + RETIRE_DELAY_FRAMES + 1,
+            ),
+            Some((7, true))
+        );
+    }
+
+    #[test]
+    fn loose_window_sibling_revalidation_migrates_pages_and_retires_superseded_slot() {
+        // Simulate a 4 MiB loose window (64 pages) replacing dead copy 1 on
+        // page 0 (`revalidate = true`) while page 5 is owned by active
+        // registered buffer copy 2.
+        let base_addr = 0x10_0000_0000u64;
+        let merged_buffers = merge_sorted_spans(&[(base_addr + 5 * PAGE, base_addr + 6 * PAGE)]);
+        let mut dir_copy = [1u32; 64];
+        dir_copy[5] = 2; // registered buffer page
+        let mut copy_pages = [63u32, 1, 0]; // slot 0 (copy 1), slot 1 (copy 2), slot 2 (copy 3)
+        let mut slot_retired_frame = [u64::MAX; 3];
+        let existing = dir_copy[0];
+        let new_copy = 3u32;
+
+        // Primary page 0 migrates from copy 1 -> copy 3.
+        dir_copy[0] = new_copy;
+        copy_pages[0] -= 1;
+        copy_pages[2] += 1;
+
+        for (p, cur) in dir_copy.iter_mut().enumerate().skip(1) {
+            let at = base_addr + p as u64 * PAGE;
+            let cur_is_buf = *cur == 2;
+            let overlaps_buf = overlaps_any_buffer(at, &merged_buffers);
+            if can_claim_sibling_page(
+                *cur,
+                new_copy,
+                existing,
+                true,  // revalidate
+                false, // incoming shadow is a loose window
+                cur_is_buf,
+                overlaps_buf,
+            ) {
+                let old_slot = (*cur - 1) as usize;
+                copy_pages[old_slot] -= 1;
+                if copy_pages[old_slot] == 0 {
+                    slot_retired_frame[old_slot] = 42;
+                }
+                *cur = new_copy;
+                copy_pages[2] += 1;
+            }
+        }
+
+        // All 63 non-buffer pages moved to copy 3; registered buffer page 5
+        // stayed on copy 2; superseded copy 1 retired cleanly at frame 42!
+        assert_eq!(dir_copy[5], 2);
+        assert!(dir_copy.iter().enumerate().all(|(p, &c)| p == 5 || c == 3));
+        assert_eq!(copy_pages, [0, 1, 63]);
+        assert_eq!(slot_retired_frame[0], 42);
+
+        // Without revalidation, a loose window never overwrites an existing copy.
+        assert!(!can_claim_sibling_page(1, 3, 1, false, false, false, false));
+        // A registered buffer supersedes a loose window even without revalidation,
+        // but never overwrites a different active registered buffer.
+        assert!(can_claim_sibling_page(1, 3, 0, false, true, false, false));
+        assert!(!can_claim_sibling_page(2, 3, 1, true, true, true, true));
     }
 
     #[test]

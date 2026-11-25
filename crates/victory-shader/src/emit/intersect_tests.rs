@@ -1733,13 +1733,6 @@ fn directory_cross_page_box32_and_fault_isolation_on_the_card() {
     let mut page1_buf = vec![0u32; 0x1_0000 / 4];
     page1_buf[(0xFFC0 / 4)..(0x1_0000 / 4)].copy_from_slice(&node[..16]);
 
-    // Copy 2 (separate D3D12 buffer!) holds Page 2 starting at non-zero byte
-    // offset `0x4000`: bytes 64..112 of the `box32` node sit at `0x4000..0x4030`.
-    let page2_off = 0x4000u32;
-    let mut page2_buf = vec![0x7fc0_deadu32; 0x8000 / 4];
-    page2_buf[(page2_off as usize / 4)..(page2_off as usize / 4 + 12)]
-        .copy_from_slice(&node[16..28]);
-
     let put_rec = |buf: &mut [u32], t: usize, addr: u64, kind: u32, active: bool| {
         let ptr = (addr >> 3) | u64::from(kind);
         let r = &mut buf[t * (RECORD / 4) as usize..][..13];
@@ -1771,47 +1764,56 @@ fn directory_cross_page_box32_and_fault_isolation_on_the_card() {
     // Thread 7: active kind 5 pointing at out-of-range page >= MEMORY_PAGES (must NOT fault!).
     put_rec(&mut page1_buf, 7, u64::from(super::MEMORY_PAGES) << 16, 5, true);
 
+    // Copy 2 (separate D3D12 buffer!) holds Page 2 at both a non-zero offset
+    // (`0x4000`) and offset `0` (exercising the `0u32.wrapping_sub(64)` ->
+    // `+64/+80/+96` wrapping path end-to-end on the GPU).
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let (out, faults, _) = dispatch_memory_timed(
-        &host,
-        &shader,
-        &page1_buf,
-        &[(1, 1, 0), (2, 2, page2_off)],
-        &[&page2_buf],
-        4 * THREADS,
-        [1, 1, 1],
-        0,
-        1,
-    )
-    .expect("directory cross-page dispatch failed");
+    for page2_off in [0x4000u32, 0u32] {
+        let mut page2_buf = vec![0x7fc0_deadu32; 0x8000 / 4];
+        page2_buf[(page2_off as usize / 4)..(page2_off as usize / 4 + 12)]
+            .copy_from_slice(&node[16..28]);
 
-    // 1. Straddling box32 matches CPU reference bit-exact!
-    assert_eq!(
-        &out[0..4],
-        bvh::intersect(&node, 5, &ray, true),
-        "cross-page box32 mismatch"
-    );
-    // 2. Masked-out lane preserves BEFORE; kinds 6/7 return MISS.
-    assert_eq!(&out[4..8], BEFORE);
-    assert_eq!(&out[8..12], bvh::MISS.map(f32::to_bits));
-    assert_eq!(&out[12..16], bvh::MISS.map(f32::to_bits));
-    // 3. Unmapped box32 reads zeros from the null UAV, matching `bvh::intersect([0; 28])` (`[NONE; 4]`).
-    assert_eq!(&out[16..20], bvh::intersect(&[0u32; 28], 5, &ray, true));
-    assert_eq!(&out[16..20], [bvh::NONE; 4]);
-    // 4. Fault table isolation: ONLY pages 42 and 4095 recorded; sink [0] stays 0!
-    assert_eq!(faults[0], 0, "sink faults[0] must remain untouched");
-    assert_eq!(faults[1], 4095, "page 4095 fault must not be erased by page 0");
-    assert_eq!(faults[43], 42, "page 42 fault missing");
-    let unexpected: Vec<(usize, u32)> = faults
-        .iter()
-        .enumerate()
-        .filter(|&(idx, &val)| val != 0 && idx != 1 && idx != 43)
-        .map(|(idx, &val)| (idx, val))
-        .collect();
-    assert!(
-        unexpected.is_empty(),
-        "spurious faults recorded: {unexpected:?}"
-    );
+        let (out, faults, _) = dispatch_memory_timed(
+            &host,
+            &shader,
+            &page1_buf,
+            &[(1, 1, 0), (2, 2, page2_off)],
+            &[&page2_buf],
+            4 * THREADS,
+            [1, 1, 1],
+            0,
+            1,
+        )
+        .expect("directory cross-page dispatch failed");
+
+        // 1. Straddling box32 matches CPU reference bit-exact!
+        assert_eq!(
+            &out[0..4],
+            bvh::intersect(&node, 5, &ray, true),
+            "cross-page box32 mismatch (page2_off={page2_off:#x})"
+        );
+        // 2. Masked-out lane preserves BEFORE; kinds 6/7 return MISS.
+        assert_eq!(&out[4..8], BEFORE);
+        assert_eq!(&out[8..12], bvh::MISS.map(f32::to_bits));
+        assert_eq!(&out[12..16], bvh::MISS.map(f32::to_bits));
+        // 3. Unmapped box32 reads zeros from the null UAV, matching `bvh::intersect([0; 28])` (`[NONE; 4]`).
+        assert_eq!(&out[16..20], bvh::intersect(&[0u32; 28], 5, &ray, true));
+        assert_eq!(&out[16..20], [bvh::NONE; 4]);
+        // 4. Fault table isolation: ONLY pages 42 and 4095 recorded; sink [0] stays 0!
+        assert_eq!(faults[0], 0, "sink faults[0] must remain untouched");
+        assert_eq!(faults[1], 4095, "page 4095 fault must not be erased by page 0");
+        assert_eq!(faults[43], 42, "page 42 fault missing");
+        let unexpected: Vec<(usize, u32)> = faults
+            .iter()
+            .enumerate()
+            .filter(|&(idx, &val)| val != 0 && idx != 1 && idx != 43)
+            .map(|(idx, &val)| (idx, val))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "spurious faults recorded: {unexpected:?}"
+        );
+    }
 }
