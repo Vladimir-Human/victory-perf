@@ -610,8 +610,8 @@ fn library() -> Option<&'static Library> {
                 }
                 if let Blob::Mapped(file) = &lib._blob {
                     VIEW[1].store(file.len, Ordering::Relaxed);
-                    VIEW[0].store(file.at.Value as usize, Ordering::Release);
                     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+                    VIEW[0].store(file.at.Value as usize, Ordering::Release);
                 }
             } else {
                 tracing::warn!("no host pipeline library: pipelines are not kept");

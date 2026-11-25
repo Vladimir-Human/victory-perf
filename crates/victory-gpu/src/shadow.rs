@@ -883,10 +883,23 @@ fn has_avx2() -> bool {
     *ON.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
 }
 
+/// Drains write-combining buffers after sequential CPU stores into a ReBAR
+/// (`D3D12_HEAP_TYPE_GPU_UPLOAD`) mapping so subsequent reads or GPU work
+/// observe the completed writes in order.
+#[inline]
+fn wc_sfence() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SFENCE is part of baseline SSE2 on every x86-64 CPU.
+    unsafe {
+        std::arch::x86_64::_mm_sfence();
+    }
+}
+
 /// Copies `len` bytes from write-combined (USWC) memory (`src`, e.g. a ReBAR
 /// `D3D12_HEAP_TYPE_GPU_UPLOAD` mapping) into cached system memory (`dst`).
-/// Uses AVX2 `VMOVNTDQA` streaming loads on 32-byte aligned addresses to read
-/// full PCIe cache-line bursts instead of uncached scalar reads.
+/// Uses AVX2 `VMOVNTDQA` streaming loads on 32-byte aligned addresses bracketed
+/// by `_mm_mfence()` so streaming loads cannot bypass prior same-core WC stores
+/// or reorder past following WC stores or synchronization loads.
 ///
 /// # Safety
 /// `src` must be valid for reads of `len` bytes, `dst` valid for writes of
@@ -905,7 +918,20 @@ unsafe fn copy_from_wc(src: *const u8, dst: *mut u8, len: usize) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn copy_from_wc_avx2(src: *const u8, dst: *mut u8, len: usize) {
-    use std::arch::x86_64::{__m256i, _mm256_storeu_si256, _mm256_stream_load_si256};
+    use std::arch::x86_64::{__m256i, _mm_mfence, _mm256_storeu_si256, _mm256_stream_load_si256};
+    struct MfenceOnExit;
+    impl Drop for MfenceOnExit {
+        #[inline]
+        fn drop(&mut self) {
+            // SAFETY: MFENCE is part of baseline SSE2 on every x86-64 CPU.
+            unsafe { _mm_mfence() };
+        }
+    }
+    // Order VMOVNTDQA after any prior same-core WC stores / sync loads, and
+    // guarantee an exit MFENCE before any following WC stores or reads.
+    _mm_mfence();
+    let _exit_fence = MfenceOnExit;
+
     let prefix = src.align_offset(32).min(len);
     if prefix > 0 {
         // SAFETY: `prefix <= len`.
@@ -955,7 +981,8 @@ unsafe fn copy_from_wc_avx2(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Compares `len` bytes of write-combined memory (`wc_src`) against cached
 /// memory (`cached`) using AVX2 `VMOVNTDQA` streaming loads on aligned
-/// addresses, avoiding uncached PCIe scalar loads and scratch allocations.
+/// addresses bracketed by `_mm_mfence()`, avoiding uncached PCIe scalar loads
+/// and scratch allocations.
 ///
 /// # Safety
 /// Both `wc_src` and `cached` must be valid for reads of `len` bytes.
@@ -975,9 +1002,22 @@ unsafe fn slices_equal_wc(wc_src: *const u8, cached: *const u8, len: usize) -> b
 #[target_feature(enable = "avx2")]
 unsafe fn slices_equal_wc_avx2(wc_src: *const u8, cached: *const u8, len: usize) -> bool {
     use std::arch::x86_64::{
-        __m256i, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
-        _mm256_set1_epi8, _mm256_stream_load_si256,
+        __m256i, _mm_mfence, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_set1_epi8, _mm256_stream_load_si256,
     };
+    struct MfenceOnExit;
+    impl Drop for MfenceOnExit {
+        #[inline]
+        fn drop(&mut self) {
+            // SAFETY: MFENCE is part of baseline SSE2 on every x86-64 CPU.
+            unsafe { _mm_mfence() };
+        }
+    }
+    // Order VMOVNTDQA after any prior same-core WC stores / sync loads, and
+    // guarantee an exit MFENCE on every return path (including early `false`).
+    _mm_mfence();
+    let _exit_fence = MfenceOnExit;
+
     let prefix = wc_src.align_offset(32).min(len);
     for i in 0..prefix {
         // SAFETY: `i < prefix <= len`.
@@ -990,7 +1030,7 @@ unsafe fn slices_equal_wc_avx2(wc_src: *const u8, cached: *const u8, len: usize)
     // not serialize USWC streaming loads behind a per-cache-line branch.
     const BLOCK: usize = 4096;
     while at + 256 <= len {
-        let block_end = (at + BLOCK).min(len - (len - at) % 256);
+        let block_end = at.saturating_add(BLOCK).min(len - (len - at) % 256);
         let mut acc0 = _mm256_set1_epi8(-1);
         let mut acc1 = _mm256_set1_epi8(-1);
         while at < block_end {
@@ -3059,7 +3099,8 @@ impl Shadow {
                             // `changed_runs(title, host_orig)` yields the exact
                             // title-modified runs to store back to WC memory.
                             let differs = merge_gpu_into_title(title, host_orig, old);
-                            for (run_at, run_len) in changed_runs(title, host_orig) {
+                            let wc_runs = changed_runs(title, host_orig);
+                            for &(run_at, run_len) in &wc_runs {
                                 // SAFETY: inside the ReBAR mapping; sequential WC store.
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(
@@ -3068,6 +3109,9 @@ impl Shadow {
                                         run_len,
                                     );
                                 }
+                            }
+                            if !wc_runs.is_empty() {
+                                wc_sfence();
                             }
                             if differs {
                                 crate::watch::writing(start + at, n);
@@ -3239,11 +3283,14 @@ impl Shadow {
         }
         // Cut on piece boundaries, so that every worker sees whole pieces.
         let cut = |i: usize| {
+            if i == 0 {
+                return from;
+            }
             if i == threads {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let parts: Arc<Mutex<Vec<(usize, Vec<(usize, usize)>)>>> =
             Arc::new(Mutex::new(Vec::with_capacity(threads)));
@@ -3501,7 +3548,8 @@ impl Shadow {
                         // bytes at the copy's offsets (`writing`), and these
                         // are in a declared range.
                         let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                        for (r, m) in changed_runs(title, held) {
+                        let runs = changed_runs(title, held);
+                        for &(r, m) in &runs {
                             // SAFETY: inside the copy's mapping. The card may be
                             // writing the copy beside these bytes; they are
                             // written here and nothing around them.
@@ -3509,6 +3557,9 @@ impl Shadow {
                             held[r..r + m].copy_from_slice(&title[r..r + m]);
                             MERGED[1].fetch_add(1, Ordering::Relaxed);
                             MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
+                        if self.rebar != 0 && !runs.is_empty() {
+                            wc_sfence();
                         }
                     }
                     drop(before);
@@ -3695,6 +3746,9 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if self.rebar != 0 && to > from {
+            wc_sfence();
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
@@ -4836,6 +4890,73 @@ mod window_tests {
         assert_eq!(ran.load(Ordering::Relaxed), 16);
     }
 
+    #[test]
+    fn rebar_wc_write_read_compare_roundtrip() {
+        use super::{PIECE, copy_from_wc, slices_equal_wc, wc_sfence};
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !crate::rebar::supported() {
+            return;
+        }
+        const LEN: usize = 2 * PIECE; // 128 KiB
+        let Some((_buf, wc_ptr)) = host.gpu_upload_buffer(LEN as u64) else {
+            return;
+        };
+        let pattern: Vec<u8> = (0..LEN).map(|i| ((i * 29 + (i >> 8) * 7 + 3) & 0xff) as u8).collect();
+        // Store into WC VRAM, drain WCBs, then immediately read & compare via VMOVNTDQA.
+        // SAFETY: mapped 128 KiB ReBAR buffer.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), wc_ptr, LEN) };
+        wc_sfence();
+
+        let mut out = vec![0u8; LEN];
+        for (offset, sub_len) in [
+            (0usize, LEN),
+            (0, 17),
+            (1, 31),
+            (1, 300),
+            (17, 4096 + 53),
+            (31, PIECE + 129),
+            (32, PIECE),
+            (LEN - 33, 33),
+        ] {
+            out[..sub_len].fill(0);
+            // SAFETY: sub-range lies strictly within the 128 KiB mapped ReBAR buffer.
+            unsafe { copy_from_wc(wc_ptr.add(offset), out.as_mut_ptr(), sub_len) };
+            assert_eq!(&out[..sub_len], &pattern[offset..offset + sub_len], "copy_from_wc off={offset} len={sub_len}");
+            // SAFETY: valid readable ranges of length `sub_len`.
+            assert!(
+                unsafe { slices_equal_wc(wc_ptr.add(offset), pattern.as_ptr().add(offset), sub_len) },
+                "slices_equal_wc eq off={offset} len={sub_len}"
+            );
+            // Flip first, mid, and last bytes in the WC buffer and verify immediate detection.
+            for flip in [0usize, sub_len / 2, sub_len - 1] {
+                let target = offset + flip;
+                // SAFETY: inside mapped ReBAR buffer.
+                unsafe {
+                    wc_ptr.add(target).write(pattern[target] ^ 0xff);
+                }
+                wc_sfence();
+                // SAFETY: valid readable ranges of length `sub_len`.
+                assert!(
+                    !unsafe { slices_equal_wc(wc_ptr.add(offset), pattern.as_ptr().add(offset), sub_len) },
+                    "slices_equal_wc missed flip off={offset} len={sub_len} flip={flip}"
+                );
+                // Restore original byte and confirm equality returns immediately.
+                // SAFETY: inside mapped ReBAR buffer.
+                unsafe {
+                    wc_ptr.add(target).write(pattern[target]);
+                }
+                wc_sfence();
+                // SAFETY: valid readable ranges of length `sub_len`.
+                assert!(
+                    unsafe { slices_equal_wc(wc_ptr.add(offset), pattern.as_ptr().add(offset), sub_len) },
+                    "slices_equal_wc stale after restore off={offset} len={sub_len} flip={flip}"
+                );
+            }
+        }
+    }
+
     /// End-to-end release benchmarks comparing BEFORE (baseline scalar/unindexed)
     /// vs AFTER (bitmask + AVX2 + VMOVNTDQA) on CPU and real D3D12 ReBAR /
     /// shared buffers. Run with:
@@ -5234,7 +5355,8 @@ mod window_tests {
                 let host_orig = &wc_scratch[first..=last];
                 let t_slice = &mut title_1m[off + first..=off + last];
                 let _ = super::merge_gpu_into_title(t_slice, host_orig, &old_s[first..=last]);
-                for (run_at, run_len) in changed_runs(t_slice, host_orig) {
+                let runs = changed_runs(t_slice, host_orig);
+                for &(run_at, run_len) in &runs {
                     // SAFETY: sequential WC write of changed run only.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
@@ -5243,6 +5365,9 @@ mod window_tests {
                             run_len,
                         );
                     }
+                }
+                if !runs.is_empty() {
+                    super::wc_sfence();
                 }
             }
             let rebar_cb_after = t0.elapsed();
@@ -5253,7 +5378,7 @@ mod window_tests {
                 (8 * BUF_LEN) as f64 / rebar_write_memcpy.as_secs_f64() / 1e9,
             );
             println!(
-                "[BENCH] ReBAR GPU_UPLOAD read 16MiB: before(memcpy)={rebar_read_before:?} ({:.3} GB/s), after(VMOVNTDQA 1T)={rebar_read_after:?} ({:.3} GB/s, {:.1}x), wide(MT)={rebar_read_wide:?} ({:.3} GB/s, {:.1}x)",
+                "[BENCH] ReBAR GPU_UPLOAD read 16MiB: before(memcpy)={rebar_read_before:?} ({:.3} GB/s), after(VMOVNTDQA 1T)={rebar_read_after:?} ({:.3} GB/s, {:.1}x), copy_wide(WC-1T)={rebar_read_wide:?} ({:.3} GB/s, {:.1}x)",
                 BUF_LEN as f64 / rebar_read_before.as_secs_f64() / 1e9,
                 BUF_LEN as f64 / rebar_read_after.as_secs_f64() / 1e9,
                 rebar_read_before.as_secs_f64() / rebar_read_after.as_secs_f64(),
@@ -5261,7 +5386,7 @@ mod window_tests {
                 rebar_read_before.as_secs_f64() / rebar_read_wide.as_secs_f64(),
             );
             println!(
-                "[BENCH] ReBAR GPU_UPLOAD cmp 16MiB: before(slice==)={rebar_cmp_before:?} ({:.3} GB/s), after(slices_equal_wc 1T)={rebar_cmp_after:?} ({:.3} GB/s, {:.1}x), wide(MT)={rebar_cmp_wide:?} ({:.3} GB/s, {:.1}x)",
+                "[BENCH] ReBAR GPU_UPLOAD cmp 16MiB: before(slice==)={rebar_cmp_before:?} ({:.3} GB/s), after(slices_equal_wc 1T)={rebar_cmp_after:?} ({:.3} GB/s, {:.1}x), find_pieces_wc(WC-1T)={rebar_cmp_wide:?} ({:.3} GB/s, {:.1}x)",
                 BUF_LEN as f64 / rebar_cmp_before.as_secs_f64() / 1e9,
                 BUF_LEN as f64 / rebar_cmp_after.as_secs_f64() / 1e9,
                 rebar_cmp_before.as_secs_f64() / rebar_cmp_after.as_secs_f64(),
