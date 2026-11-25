@@ -15,6 +15,7 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    pub max_wave_lanes: Option<u32>,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -119,7 +120,20 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
-            Ok(Host { device })
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            let has_wave_lanes = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+                && options.WaveOps.as_bool()
+                && options.WaveLaneCountMax != 0;
+            Ok(Host {
+                device,
+                max_wave_lanes: has_wave_lanes.then_some(options.WaveLaneCountMax),
+            })
         }
     }
 
@@ -240,8 +254,19 @@ impl Host {
         &self,
         cs: &HostShader,
     ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
-        let root = self.root_signature_for(&[(cs, D3D12_SHADER_VISIBILITY_ALL)])?;
-        let pso = self.compute_pipeline_with(&root, &cs.dxil)?;
+        if let (Some(required), Some(max)) = (cs.required_wave_size(), self.max_wave_lanes)
+            && required > max
+        {
+            return Err(format!(
+                "compute shader requires wave{required}, but the host supports up to wave{max}"
+            ));
+        }
+        let root = self
+            .root_signature_for(&[(cs, D3D12_SHADER_VISIBILITY_ALL)])
+            .map_err(|e| format!("compute root signature: {e}"))?;
+        let pso = self
+            .compute_pipeline_with(&root, &cs.dxil)
+            .map_err(|e| format!("compute PSO: {e}"))?;
         Ok((root, pso))
     }
 
@@ -1448,6 +1473,43 @@ impl Host {
             }
             drop(keep);
             Ok(out)
+        }
+    }
+}
+
+#[cfg(test)]
+mod wave_precheck_tests {
+    use super::*;
+    use crate::HwStage;
+
+    #[test]
+    #[ignore = "requires two DXC-built compute shaders and a 32-lane host"]
+    fn offline_compute_pipeline_classifies_fixed_wave_size() {
+        let device = Host::new(false).expect("D3D12 host");
+        assert_eq!(device.max_wave_lanes, Some(32));
+        for (width, var) in [(32, "WAVE32_FIXTURE"), (64, "WAVE64_FIXTURE")] {
+            let path = std::env::var_os(var).expect("fixture path");
+            let cs = HostShader {
+                stage: HwStage::Cs,
+                dxil: std::fs::read(path).expect("fixture bytecode"),
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                root_indexed_views: Vec::new(),
+            };
+            assert_eq!(cs.required_wave_size(), Some(width));
+            let result = device.compute_pipeline(&cs);
+            if width == 32 {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "compute shader requires wave64, but the host supports up to wave32"
+                );
+            }
         }
     }
 }
