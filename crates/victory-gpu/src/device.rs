@@ -233,6 +233,31 @@ extern "system" fn node_count(_: This) -> u32 {
     1
 }
 
+/// Queries the host device's supported wave lane limits (min, max) via D3D12_OPTIONS1.
+#[cfg(windows)]
+pub(crate) fn query_wave_lane_limits(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+) -> Option<(u32, u32)> {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the query writes an OPTIONS1 structure of the given size.
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }
+    .is_ok();
+    if ok && options.WaveOps.as_bool() && options.WaveLaneCountMax != 0 {
+        Some((options.WaveLaneCountMin, options.WaveLaneCountMax))
+    } else {
+        None
+    }
+}
+
 /// Feature query 2: the highest of the requested feature levels we support.
 #[repr(C)]
 struct FeatureLevels {
@@ -583,5 +608,19 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn query_wave_lane_limits_reports_capabilities() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let limits = query_wave_lane_limits(&host.device);
+        if let Some((min, max)) = limits {
+            assert!(min <= max);
+            assert!(min.is_power_of_two());
+            assert!(max.is_power_of_two());
+        }
     }
 }

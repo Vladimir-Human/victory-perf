@@ -457,6 +457,7 @@ const MAKING: u8 = 3;
 
 struct Queue {
     early: VecDeque<Arc<Pending>>,
+    early_depth: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
 }
 
@@ -464,6 +465,7 @@ impl Queue {
     const fn new() -> Self {
         Self {
             early: VecDeque::new(),
+            early_depth: VecDeque::new(),
             requested: VecDeque::new(),
         }
     }
@@ -478,6 +480,14 @@ impl Queue {
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED {
             self.requested.push_back(p.clone());
+        } else if p
+            .graphics
+            .as_ref()
+            .is_some_and(|state| state.writes_depth_only())
+        {
+            // Shadow maps and depth prepasses supply several later draws. Rebuild
+            // their previously used PSOs first while no draw is requesting one.
+            self.early_depth.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
         }
@@ -487,8 +497,12 @@ impl Queue {
     fn pop(&mut self) -> Option<Arc<Pending>> {
         let p = self.requested.pop_front().or_else(|| {
             // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+            std::iter::from_fn(|| {
+                self.early_depth
+                    .pop_front()
+                    .or_else(|| self.early.pop_front())
+            })
+            .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         })?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)

@@ -374,6 +374,25 @@ struct Physical {
     shown: HashMap<(usize, usize), Vec<usize>>,
 }
 
+impl Physical {
+    /// Windows unmaps every intersected view in full, even when unmapping
+    /// one page in its middle. Caller holds PHYSICAL until remapping ends.
+    fn unmap_extent(&self, base: usize, end: usize) -> std::ops::Range<usize> {
+        let start = self
+            .views
+            .range(..=base)
+            .next_back()
+            .filter(|(at, (size, _))| *at + size > base)
+            .map_or(base, |(&at, _)| at);
+        let end = self
+            .views
+            .range(..end)
+            .next_back()
+            .map_or(end, |(&at, (size, _))| end.max(at + size));
+        start..end
+    }
+}
+
 impl Slice {
     /// The page `k` pages on, as [`Physical::shown`] names it.
     fn key(&self, k: usize) -> (usize, usize) {
@@ -640,13 +659,22 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    if n == 0 {
+        return address;
+    }
+    let Some(len) = n.checked_mul(PAGE) else {
+        return std::ptr::null_mut();
+    };
+    let Some(end) = base.checked_add(len) else {
+        return std::ptr::null_mut();
+    };
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
-    // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
+    // into that gap (`victory_gpu::title_memory_remapping_range`).
+    let _changing = victory_gpu::title_memory_remapping_range(physical.unmap_extent(base, end));
+    unmap(&mut physical, base, len);
     if pages.is_null() {
         return address;
     }
@@ -712,9 +740,23 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    if len == 0 {
+        return true;
+    }
+    let span = if from == 0 {
+        Some(len)
+    } else {
+        len.checked_next_multiple_of(PAGE)
+    };
+    let Some(end) = span.and_then(|span| to.checked_add(span)) else {
+        return false;
+    };
+    if from.checked_add(len).is_none() {
+        return false;
+    }
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping_range(physical.unmap_extent(to, end));
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {

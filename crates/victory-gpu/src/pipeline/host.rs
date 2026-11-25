@@ -92,6 +92,59 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    pub(super) fn writes_depth_only(&self) -> bool {
+        self.targets.NumRenderTargets == 0
+            && self.depth_format != DXGI_FORMAT_UNKNOWN
+            && self.depth.DepthEnable.as_bool()
+            && self.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL
+    }
+
+    /// The guest color buffer bypasses its blender for integer surfaces,
+    /// even when the draw asks for blending. D3D12 validates blend enable
+    /// against every active target format when the pipeline is created.
+    pub(crate) fn apply_integer_blend_bypass(&mut self) {
+        let integer = |f: &DXGI_FORMAT| {
+            matches!(
+                *f,
+                DXGI_FORMAT_R32G32B32A32_UINT
+                    | DXGI_FORMAT_R32G32B32A32_SINT
+                    | DXGI_FORMAT_R32G32B32_UINT
+                    | DXGI_FORMAT_R32G32B32_SINT
+                    | DXGI_FORMAT_R16G16B16A16_UINT
+                    | DXGI_FORMAT_R16G16B16A16_SINT
+                    | DXGI_FORMAT_R32G32_UINT
+                    | DXGI_FORMAT_R32G32_SINT
+                    | DXGI_FORMAT_R10G10B10A2_UINT
+                    | DXGI_FORMAT_R8G8B8A8_UINT
+                    | DXGI_FORMAT_R8G8B8A8_SINT
+                    | DXGI_FORMAT_R16G16_UINT
+                    | DXGI_FORMAT_R16G16_SINT
+                    | DXGI_FORMAT_R32_UINT
+                    | DXGI_FORMAT_R32_SINT
+                    | DXGI_FORMAT_R8G8_UINT
+                    | DXGI_FORMAT_R8G8_SINT
+                    | DXGI_FORMAT_R16_UINT
+                    | DXGI_FORMAT_R16_SINT
+                    | DXGI_FORMAT_R8_UINT
+                    | DXGI_FORMAT_R8_SINT
+            )
+        };
+        let formats = &self.targets.RTFormats[..(self.targets.NumRenderTargets as usize).min(8)];
+        if !self.blend.IndependentBlendEnable.as_bool() {
+            let shared = self.blend.RenderTarget[0];
+            if !shared.BlendEnable.as_bool() || !formats.iter().any(integer) {
+                return;
+            }
+            self.blend.RenderTarget[..formats.len()].fill(shared);
+            self.blend.IndependentBlendEnable = (formats.len() > 1).into();
+        }
+        for (format, target) in formats.iter().zip(&mut self.blend.RenderTarget) {
+            if integer(format) {
+                target.BlendEnable = false.into();
+            }
+        }
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -337,6 +390,15 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
         tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
     }
     None
+}
+
+fn unsupported_compute_wave(
+    required_wave: Option<u32>,
+    wave_lanes: Option<(u32, u32)>,
+) -> Option<(u32, u32, u32)> {
+    let req = required_wave?;
+    let (min, max) = wave_lanes?;
+    (!(min..=max).contains(&req)).then_some((req, min, max))
 }
 
 /// Appends one translated stage's root parameters and static samplers to a
@@ -592,7 +654,19 @@ impl HostPipeline {
                 },
             )
         };
-        if compute.is_some() {
+        if let Some(cs) = compute {
+            let required_wave = cs.translated().and_then(|t| t.host.required_wave_size());
+            if let Some((req, min, max)) = unsupported_compute_wave(required_wave, host.wave_lanes)
+            {
+                tracing::warn!(
+                    ?shaders,
+                    required_wave = req,
+                    device_min = min,
+                    device_max = max,
+                    "compute shader requires wave{req} but host GPU supports {min}..={max}. Skipping pipeline creation"
+                );
+                return None;
+            }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -1129,6 +1203,42 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn integer_target_bypasses_blending_and_preserves_mixed_target_masks() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[..3].copy_from_slice(&[
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_B4G4R4A4_UNORM,
+            DXGI_FORMAT_R8_UINT,
+        ]);
+        g.blend.IndependentBlendEnable = true.into();
+        for (i, target) in g.blend.RenderTarget[..3].iter_mut().enumerate() {
+            target.BlendEnable = true.into();
+            target.BlendOp = D3D12_BLEND_OP_MAX;
+            target.RenderTargetWriteMask = [15, 15, 1][i];
+        }
+        let before = g.blend;
+        g.apply_integer_blend_bypass();
+        assert_eq!(g.blend.RenderTarget[0..2], before.RenderTarget[0..2]);
+        let mut expected = before.RenderTarget[2];
+        expected.BlendEnable = false.into();
+        assert_eq!(g.blend.RenderTarget[2], expected);
+
+        g.blend = before;
+        g.blend.IndependentBlendEnable = false.into();
+        g.blend.RenderTarget[0].RenderTargetWriteMask = 3;
+        g.targets.RTFormats.swap(0, 2);
+        g.apply_integer_blend_bypass();
+        assert!(g.blend.IndependentBlendEnable.as_bool());
+        assert!(!g.blend.RenderTarget[0].BlendEnable.as_bool());
+        for target in &g.blend.RenderTarget[1..3] {
+            assert!(target.BlendEnable.as_bool());
+            assert_eq!(target.BlendOp, D3D12_BLEND_OP_MAX);
+            assert_eq!(target.RenderTargetWriteMask, 3);
+        }
+    }
+
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
         [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
@@ -1491,5 +1601,30 @@ mod tests {
             255,
             "depth 0.5 inside [0.4, 0.6] must pass"
         );
+    }
+
+    #[test]
+    fn wave_size_precheck_rejects_both_outside_bounds() {
+        assert_eq!(
+            unsupported_compute_wave(Some(32), Some((64, 64))),
+            Some((32, 64, 64)),
+        );
+        assert_eq!(
+            unsupported_compute_wave(Some(64), Some((32, 32))),
+            Some((64, 32, 32)),
+        );
+    }
+
+    #[test]
+    fn wave_size_precheck_accepts_boundaries_or_unknown_constraints() {
+        for supported in [16, 32, 64] {
+            assert_eq!(
+                unsupported_compute_wave(Some(supported), Some((16, 64))),
+                None,
+            );
+        }
+        assert_eq!(unsupported_compute_wave(Some(64), Some((64, 64))), None);
+        assert_eq!(unsupported_compute_wave(None, Some((64, 64))), None);
+        assert_eq!(unsupported_compute_wave(Some(32), None), None);
     }
 }
