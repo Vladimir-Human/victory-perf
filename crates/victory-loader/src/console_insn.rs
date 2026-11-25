@@ -148,15 +148,34 @@ fn add_flags(a: u64, b: u64, is_64bit: bool) -> u32 {
 
 fn readable_len(va: usize, max: usize) -> usize {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+    let mut got = 0usize;
+    while got < max {
+        let cur = va.wrapping_add(got);
+        // SAFETY: plain data filled in by the query.
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let found = unsafe { VirtualQuery(cur as *const _, &mut m, size_of_val(&m)) } != 0;
+        ASKED.fetch_add(1, Ordering::Relaxed);
+        if !found || m.State != MEM_COMMIT || m.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 {
+            break;
+        }
+        let avail = (m.BaseAddress as usize).saturating_add(m.RegionSize).saturating_sub(cur);
+        if avail == 0 {
+            break;
+        }
+        got = (got + avail).min(max);
+    }
+    got
+}
+
+fn is_committed_readonly(va: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, VirtualQuery};
     // SAFETY: plain data filled in by the query.
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
     ASKED.fetch_add(1, Ordering::Relaxed);
-    if !found || m.State != MEM_COMMIT || m.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 {
-        return 0;
-    }
-    (m.BaseAddress as usize + m.RegionSize).saturating_sub(va).min(max)
+    found && m.State == MEM_COMMIT && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && (m.Protect & 0xFF) == PAGE_READONLY
 }
 
 fn writable(va: usize, bytes: usize) -> bool {
@@ -196,19 +215,20 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     Some(to.min(end))
 }
 
-/// Atomically rewrites `0x01` -> `0x1F` at `rip + len - 2` (`monitorx`/`mwaitx` -> `0F 1F FA/FB`),
-/// serialized by `PATCH_LOCK` so concurrent faults on the same page never race `VirtualProtect`.
+/// Atomically rewrites the 1-byte opcode at `rip + op_off` from `expected` (`0x01` or `0xAE`)
+/// to `0x1F` (`0F 1F ...` multi-byte NOP), serialized by `PATCH_LOCK` so concurrent faults on
+/// the same page never race `VirtualProtect`.
 ///
 /// # Safety
-/// `rip..rip + len` is readable code ending in `[0x0F, 0x01, 0xFA | 0xFB]`.
-unsafe fn patch_wait_to_nop(rip: usize, len: usize) -> bool {
-    let op_addr = rip + len - 2;
+/// `rip..rip + len` is readable code and `op_off < len`.
+unsafe fn patch_opcode_byte(rip: usize, len: usize, op_off: usize, expected: u8) -> bool {
+    let op_addr = rip + op_off;
     let _guard = PATCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: `op_addr` lies within `[rip, rip + len)` checked readable by the caller.
     let byte = unsafe { &*(op_addr as *const AtomicU8) };
     match byte.load(Ordering::Acquire) {
         0x1F => return true,
-        0x01 => {}
+        b if b == expected => {}
         _ => return false,
     }
     let mut old = 0u32;
@@ -216,30 +236,13 @@ unsafe fn patch_wait_to_nop(rip: usize, len: usize) -> bool {
     if unsafe { VirtualProtect(op_addr as *const _, 1, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
         return false;
     }
-    let _ = byte.compare_exchange(0x01, 0x1F, Ordering::SeqCst, Ordering::Acquire);
+    let _ = byte.compare_exchange(expected, 0x1F, Ordering::SeqCst, Ordering::Acquire);
     // SAFETY: `rip..rip + len` is the instruction just patched; `old` is its prior protection.
     unsafe {
         FlushInstructionCache(GetCurrentProcess(), rip as *const _, len);
         VirtualProtect(op_addr as *const _, 1, old, &mut old);
     }
     true
-}
-
-/// Patches `clwb` (`len` bytes at `rip`) to `0x90` NOPs under `PATCH_LOCK`.
-///
-/// # Safety
-/// `rip..rip + len` is readable code for a `clwb` instruction.
-unsafe fn patch_clwb_to_nop(rip: usize, len: usize) {
-    let _guard = PATCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut old = 0u32;
-    // SAFETY: the instruction's own bytes, made writable for the patch and restored under `PATCH_LOCK`.
-    unsafe {
-        if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
-            std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
-            FlushInstructionCache(GetCurrentProcess(), rip as *const _, len);
-            VirtualProtect(rip as *const _, len, old, &mut old);
-        }
-    }
 }
 
 /// Computes `(iterations, final_state)` for an accelerated `clzero` loop, or `None` when the
@@ -275,7 +278,7 @@ fn plan_clzero_loop(ctx: &CONTEXT, lp: ClzeroLoop) -> Option<LoopOutcome> {
                 final_eflags: (ctx.EFlags & !CMP_FLAGS) | flags,
             })
         }
-        ClzeroLoop::CountDown { cnt_reg, step, is_64bit, is_dec, above, is_add_neg } => {
+        ClzeroLoop::CountDown { cnt_reg, step, is_64bit, is_dec, dec_cf, above, is_add_neg } => {
             let raw_cnt = read_gpr(ctx, cnt_reg);
             let cnt = if is_64bit { raw_cnt } else { raw_cnt as u32 as u64 };
             let step_u64 = u64::from(step);
@@ -291,7 +294,10 @@ fn plan_clzero_loop(ctx: &CONTEXT, lp: ClzeroLoop) -> Option<LoopOutcome> {
             let final_rax = start.checked_add(iters.checked_mul(64)?)?;
             let flags = if is_dec {
                 let f = sub_flags(last_before, step_u64, is_64bit);
-                (ctx.EFlags & !(CMP_FLAGS & !1)) | (f & !1)
+                match dec_cf {
+                    Some(cf) => (ctx.EFlags & !CMP_FLAGS) | (f & !1) | u32::from(cf),
+                    None => (ctx.EFlags & !(CMP_FLAGS & !1)) | (f & !1),
+                }
             } else if is_add_neg {
                 let f = add_flags(last_before, (-(step as i64)) as u64, is_64bit);
                 (ctx.EFlags & !CMP_FLAGS) | f
@@ -354,13 +360,16 @@ fn advance_partial_clzero_loop(ctx: &mut CONTEXT, lp: ClzeroLoop, done_iters: u6
 }
 
 /// Executes a single `clzero` cache-line zero at `RAX` (or `EAX` if `0x67` prefix is present).
-fn exec_single_clzero(ctx: &CONTEXT, code: &[u8], clzero_end: usize) -> bool {
+/// In live VEH mode (`allow_readonly_fault == true`), committed `PAGE_READONLY` memory is written
+/// directly so an upstream write-watch VEH (`victory-gpu::watch`) can open the guard page, or a
+/// genuine read-only fault can surface as `STATUS_ACCESS_VIOLATION`.
+fn exec_single_clzero(ctx: &CONTEXT, code: &[u8], clzero_end: usize, allow_readonly_fault: bool) -> bool {
     let a32 = code[..clzero_end - 3].contains(&0x67);
     let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
-    if !writable(line, 64) {
-        return false; // the real instruction faults there too
+    if !writable(line, 64) && !(allow_readonly_fault && is_committed_readonly(line)) {
+        return false; // unmapped, guard, or non-faulting unit test on RO memory
     }
-    // SAFETY: the 64-byte line is committed and writable.
+    // SAFETY: `line` is writable or committed `PAGE_READONLY` (watch-guarded or raising write AV).
     unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
     true
 }
@@ -388,28 +397,26 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     let rip = ctx.Rip as usize;
     // The same few instructions fault again and again: their readable length is asked once.
     let known = if remembers() { CODE.with(Cell::get) } else { [(0, 0); 8] };
-    let n = match known.iter().find(|&&(at, n)| at == rip && n > 0) {
-        Some(&(_, n)) => n,
-        None => {
-            let n = readable_len(rip, 32);
-            if n == 0 {
-                return 0;
-            }
-            if remembers() {
-                let mut known = known;
-                known.rotate_right(1);
-                known[0] = (rip, n);
-                CODE.with(|c| c.set(known));
-            }
-            n
-        }
+    let cached = known.iter().find(|&&(at, n)| at == rip && n > 0).map(|&(_, n)| n);
+    let n = match cached {
+        Some(n) => n,
+        None => readable_len(rip, 32),
     };
+    if n == 0 {
+        return 0;
+    }
     // SAFETY: `n` bytes at `rip` are readable.
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
     let Some((what, len)) = decode::decode(code) else { return 0 };
-    if what == ConsoleOnly::PatchedWait {
-        // Another thread patched `0F 01 FA/FB` -> `0F 1F FA/FB` right after we faulted:
-        // retry at the same `Rip` so the CPU executes the multi-byte NOP.
+    if cached.is_none() && remembers() {
+        let mut known = known;
+        known.rotate_right(1);
+        known[0] = (rip, n);
+        CODE.with(|c| c.set(known));
+    }
+    if what == ConsoleOnly::PatchedInsn {
+        // Another thread patched `0F 01 FA/FB` or `66 0F AE /6` -> `0F 1F ...` right after we
+        // faulted: retry at the same `Rip` so the CPU executes the multi-byte NOP.
         return CONTINUE_EXECUTION;
     }
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
@@ -445,23 +452,23 @@ unsafe fn apply_emulation(ctx: &mut CONTEXT, code: &[u8], what: ConsoleOnly, len
     let mut step_len = len;
     match what {
         ConsoleOnly::Ud2 => return 0,
-        ConsoleOnly::PatchedWait => return CONTINUE_EXECUTION,
+        ConsoleOnly::PatchedInsn => return CONTINUE_EXECUTION,
         ConsoleOnly::Clwb => {
-            if allow_patch {
-                // SAFETY: `rip..rip + len` is readable code for `clwb`.
-                unsafe { patch_clwb_to_nop(rip, len) };
+            if allow_patch && let Some(op_off) = decode::opcode_byte_offset(&code[..len]) {
+                // SAFETY: `rip..rip + len` is readable code for `clwb` (`0F AE`).
+                let _ = unsafe { patch_opcode_byte(rip, len, op_off, 0xAE) };
             }
         }
         ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {
             if allow_patch && patch_wait() {
                 // SAFETY: `rip..rip + len` is readable code ending in `0F 01 FA/FB`.
-                let _ = unsafe { patch_wait_to_nop(rip, len) };
+                let _ = unsafe { patch_opcode_byte(rip, len, len - 2, 0x01) };
             } else if what == ConsoleOnly::Mwaitx {
                 std::hint::spin_loop();
             }
         }
         ConsoleOnly::Clzero => {
-            if !exec_single_clzero(ctx, code, len) {
+            if !exec_single_clzero(ctx, code, len, allow_patch) {
                 return 0;
             }
         }
@@ -480,16 +487,29 @@ unsafe fn apply_emulation(ctx: &mut CONTEXT, code: &[u8], what: ConsoleOnly, len
                     at = to;
                 }
                 if at == zero_start {
-                    return 0;
-                }
-                ZEROED.fetch_add((at - zero_start) as u64, Ordering::Relaxed);
-                if at < zero_end {
-                    let done_iters = ((at - zero_start) / 64) as u64;
-                    if done_iters == 0 {
+                    if allow_patch && is_committed_readonly(zero_start) {
+                        // Trigger write on `PAGE_READONLY` so an upstream write-watch VEH can
+                        // open the guard page (or a real read-only fault surfaces as AV).
+                        // SAFETY: committed `PAGE_READONLY` 64-byte cache line.
+                        unsafe { std::ptr::write_bytes(zero_start as *mut u8, 0, 64) };
+                        ZEROED.fetch_add(64, Ordering::Relaxed);
+                        if outcome.iters > 1 {
+                            advance_partial_clzero_loop(ctx, lp, 1);
+                            return CONTINUE_EXECUTION;
+                        }
+                    } else {
                         return 0;
                     }
-                    advance_partial_clzero_loop(ctx, lp, done_iters);
-                    return CONTINUE_EXECUTION;
+                } else {
+                    ZEROED.fetch_add((at - zero_start) as u64, Ordering::Relaxed);
+                    if at < zero_end {
+                        let done_iters = ((at - zero_start) / 64) as u64;
+                        if done_iters == 0 {
+                            return 0;
+                        }
+                        advance_partial_clzero_loop(ctx, lp, done_iters);
+                        return CONTINUE_EXECUTION;
+                    }
                 }
                 ctx.Rax = outcome.final_rax;
                 if let Some((reg, val)) = outcome.final_aux {
@@ -499,7 +519,7 @@ unsafe fn apply_emulation(ctx: &mut CONTEXT, code: &[u8], what: ConsoleOnly, len
             } else {
                 // Entry state doesn't take >0 full accelerated passes: emulate just `clzero` (3 bytes).
                 let clzero_len = code[..len].windows(3).position(|w| w == [0x0F, 0x01, 0xFC]).map_or(3, |p| p + 3);
-                if !exec_single_clzero(ctx, code, clzero_len) {
+                if !exec_single_clzero(ctx, code, clzero_len, allow_patch) {
                     return 0;
                 }
                 step_len = clzero_len;
@@ -840,6 +860,235 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn countdown_dec_cf_semantics() {
+        let mut buf = [0xAAu8; 64 * 3];
+        // 1) add rax, 0x40; dec rcx; jne -> pre-loop CF=1 must become CF=0, ZF=1
+        let add_dec = [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0xFF, 0xC9, 0x75, 0xF4];
+        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+        ctx.Rax = buf.as_mut_ptr() as u64;
+        ctx.Rcx = 2;
+        ctx.EFlags = 1; // CF=1
+        assert_eq!(unsafe { emulate_slice(&mut ctx, &add_dec) }, Some(12));
+        assert_eq!(ctx.EFlags & 0x41, 0x40, "add +0x40; dec must clear CF and set ZF");
+
+        // 2) sub rax, -0x40; dec rcx; jne -> pre-loop CF=0 must become CF=1, ZF=1
+        let sub_dec = [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xE8, 0xC0, 0x48, 0xFF, 0xC9, 0x75, 0xF4];
+        ctx = unsafe { std::mem::zeroed() };
+        ctx.Rax = buf.as_mut_ptr() as u64;
+        ctx.Rcx = 2;
+        ctx.EFlags = 0; // CF=0
+        assert_eq!(unsafe { emulate_slice(&mut ctx, &sub_dec) }, Some(12));
+        assert_eq!(ctx.EFlags & 0x41, 0x41, "sub -0x40; dec must set CF=1 and ZF=1");
+
+        // 3) lea rax, [rax+0x40]; dec rcx; jne AND dec rcx; lea rax, [rax+0x40]; jne preserve CF
+        let lea_dec = [0x0F, 0x01, 0xFC, 0x48, 0x8D, 0x40, 0x40, 0x48, 0xFF, 0xC9, 0x75, 0xF4];
+        let dec_lea = [0x0F, 0x01, 0xFC, 0x48, 0xFF, 0xC9, 0x48, 0x8D, 0x40, 0x40, 0x75, 0xF4];
+        for seq in [lea_dec, dec_lea] {
+            for init_cf in [0u32, 1u32] {
+                ctx = unsafe { std::mem::zeroed() };
+                ctx.Rax = buf.as_mut_ptr() as u64;
+                ctx.Rcx = 2;
+                ctx.EFlags = init_cf;
+                assert_eq!(unsafe { emulate_slice(&mut ctx, &seq) }, Some(12));
+                assert_eq!(ctx.EFlags & 0x41, 0x40 | init_cf, "lea + dec must preserve CF={init_cf}");
+            }
+        }
+    }
+
+    #[test]
+    fn straddling_wait_and_clzero_loop_across_distinct_page_protections() {
+        crate::report_crashes();
+        // Two adjacent executable pages with distinct protections: PAGE_EXECUTE_READ + PAGE_EXECUTE_READWRITE.
+        // SAFETY: allocates 2 pages with VirtualAlloc and frees them at the end.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            let p0 = base;
+            let p1 = base.add(0x1000);
+            let mut old = 0u32;
+
+            let prot_of = |addr: *const u8| {
+                let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_ne!(VirtualQuery(addr.cast(), &mut m, size_of_val(&m)), 0);
+                m.Protect
+            };
+
+            // Case A: `0F` at p0_end - 1, `01 FA C3` on p1
+            assert_ne!(VirtualProtect(p0.cast(), 0x2000, PAGE_READWRITE, &mut old), 0);
+            let site_a = p1.sub(1);
+            std::ptr::copy_nonoverlapping([0x0F, 0x01, 0xFA, 0xC3].as_ptr(), site_a, 4);
+            assert_ne!(VirtualProtect(p0.cast(), 0x1000, PAGE_EXECUTE_READ, &mut old), 0);
+            assert_ne!(VirtualProtect(p1.cast(), 0x1000, PAGE_EXECUTE_READWRITE, &mut old), 0);
+
+            let fa: unsafe extern "win64" fn() = std::mem::transmute(site_a);
+            let e0 = emulated_count();
+            fa();
+            assert_eq!(emulated_count() - e0, 1);
+            assert_eq!(std::slice::from_raw_parts(site_a, 4), &[0x0F, 0x1F, 0xFA, 0xC3]);
+            assert_eq!(prot_of(p0), PAGE_EXECUTE_READ);
+            assert_eq!(prot_of(p1), PAGE_EXECUTE_READWRITE);
+            fa();
+            assert_eq!(emulated_count() - e0, 1);
+
+            // Case B: `0F 01` at p0_end - 2, `FA C3` on p1 (patched byte `01` sits on p0!)
+            assert_ne!(VirtualProtect(p0.cast(), 0x1000, PAGE_READWRITE, &mut old), 0);
+            let site_b = p1.sub(2);
+            std::ptr::copy_nonoverlapping([0x0F, 0x01, 0xFA, 0xC3].as_ptr(), site_b, 4);
+            assert_ne!(VirtualProtect(p0.cast(), 0x1000, PAGE_EXECUTE_READ, &mut old), 0);
+            FlushInstructionCache(GetCurrentProcess(), site_b.cast(), 4);
+
+            let fb: unsafe extern "win64" fn() = std::mem::transmute(site_b);
+            let e1 = emulated_count();
+            fb();
+            assert_eq!(emulated_count() - e1, 1);
+            assert_eq!(std::slice::from_raw_parts(site_b, 4), &[0x0F, 0x1F, 0xFA, 0xC3]);
+            assert_eq!(prot_of(p0), PAGE_EXECUTE_READ);
+            assert_eq!(prot_of(p1), PAGE_EXECUTE_READWRITE);
+            fb();
+            assert_eq!(emulated_count() - e1, 1);
+
+            // Case C: 12-byte clzero loop + ret straddling p0 (RX) -> p1 (RWX)
+            assert_ne!(VirtualProtect(p0.cast(), 0x1000, PAGE_READWRITE, &mut old), 0);
+            // mov rax, rcx; clzero; add rax, 0x40; cmp rax, rdx; jb -12; ret
+            let loop_bytes = [
+                0x48, 0x89, 0xC8, // mov rax, rcx (3)
+                0x0F, 0x01, 0xFC, // clzero (starts at p1 - 4!)
+                0x48, 0x83, 0xC0, 0x40, // add rax, 0x40
+                0x48, 0x39, 0xD0, // cmp rax, rdx
+                0x72, 0xF4, // jb -12
+                0xC3, // ret
+            ];
+            let entry_c = p1.sub(7); // clzero starts at p1 - 4, 4 bytes on p0, 8+1 on p1
+            std::ptr::copy_nonoverlapping(loop_bytes.as_ptr(), entry_c, loop_bytes.len());
+            assert_ne!(VirtualProtect(p0.cast(), 0x1000, PAGE_EXECUTE_READ, &mut old), 0);
+            FlushInstructionCache(GetCurrentProcess(), entry_c.cast(), loop_bytes.len());
+
+            #[repr(align(64))]
+            struct Buf([u8; 64 * 4]);
+            let mut target = Buf([0x77; 64 * 4]);
+            let fc: unsafe extern "win64" fn(*mut u8, *mut u8) = std::mem::transmute(entry_c);
+            let e2 = emulated_count();
+            fc(target.0.as_mut_ptr(), target.0.as_mut_ptr().add(64 * 4));
+            assert_eq!(emulated_count() - e2, 1, "straddling clzero loop must execute in 1 fault");
+            assert!(target.0.iter().all(|&b| b == 0));
+
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn clzero_and_clzero_loop_open_guarded_page_readonly_via_upstream_veh() {
+        use std::sync::atomic::AtomicUsize;
+        use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_POINTERS, RemoveVectoredExceptionHandler,
+        };
+
+        static WATCH_BASE: AtomicUsize = AtomicUsize::new(0);
+        static WATCH_LEN: AtomicUsize = AtomicUsize::new(0);
+        static WATCH_OPENED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "system" fn open_ro_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: system passes valid exception pointers.
+            let r = unsafe { &*(*info).ExceptionRecord };
+            if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r.NumberParameters >= 2 && r.ExceptionInformation[0] == 1 {
+                let addr = r.ExceptionInformation[1];
+                let base = WATCH_BASE.load(Ordering::Acquire);
+                let len = WATCH_LEN.load(Ordering::Acquire);
+                if base != 0 && addr >= base && addr < base + len {
+                    let page = addr & !0xFFF;
+                    let mut old = 0u32;
+                    // SAFETY: test's own guarded page opened to PAGE_READWRITE.
+                    if unsafe { VirtualProtect(page as *const _, 0x1000, PAGE_READWRITE, &mut old) } != 0 {
+                        WATCH_OPENED.fetch_add(1, Ordering::Relaxed);
+                        return CONTINUE_EXECUTION;
+                    }
+                }
+            }
+            0
+        }
+
+        crate::report_crashes();
+        // SAFETY: allocates 2 pages for this test, registers scoped first-chance VEH, and cleans up.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            std::ptr::write_bytes(base, 0xEE, 0x2000);
+            WATCH_BASE.store(base as usize, Ordering::Release);
+            WATCH_LEN.store(0x2000, Ordering::Release);
+            WATCH_OPENED.store(0, Ordering::Release);
+
+            let veh = AddVectoredExceptionHandler(1, Some(open_ro_veh));
+            assert!(!veh.is_null());
+
+            let mut old = 0u32;
+            // 1) Single `clzero` directly on guarded PAGE_READONLY page 0
+            assert_ne!(VirtualProtect(base.cast(), 0x1000, PAGE_READONLY, &mut old), 0);
+            std::arch::asm!(".byte 0x0f, 0x01, 0xfc", in("rax") base);
+            assert_eq!(WATCH_OPENED.load(Ordering::Relaxed), 1);
+            assert!(std::slice::from_raw_parts(base, 64).iter().all(|&b| b == 0));
+            assert!(std::slice::from_raw_parts(base.add(64), 64).iter().all(|&b| b == 0xEE));
+
+            // 2) ClzeroLoop starting on PAGE_READWRITE page 0 and crossing into guarded PAGE_READONLY page 1
+            std::ptr::write_bytes(base, 0xDD, 0x2000);
+            assert_ne!(VirtualProtect(base.add(0x1000).cast(), 0x1000, PAGE_READONLY, &mut old), 0);
+            let loop_buf = ExecBuf::new(&[
+                0x48, 0x89, 0xC8, // mov rax, rcx
+                0x0F, 0x01, 0xFC, // clzero
+                0x48, 0x83, 0xC0, 0x40, // add rax, 0x40
+                0x48, 0x39, 0xD0, // cmp rax, rdx
+                0x72, 0xF4, // jb -12
+                0xC3, // ret
+            ]);
+            let f: unsafe extern "win64" fn(*mut u8, *mut u8) = std::mem::transmute(loop_buf.ptr);
+            f(base, base.add(0x2000));
+            assert_eq!(WATCH_OPENED.load(Ordering::Relaxed), 2);
+            assert!(std::slice::from_raw_parts(base, 0x2000).iter().all(|&b| b == 0));
+
+            // 3) ClzeroLoop starting directly on guarded PAGE_READONLY page 0
+            std::ptr::write_bytes(base, 0xCC, 0x1000);
+            assert_ne!(VirtualProtect(base.cast(), 0x1000, PAGE_READONLY, &mut old), 0);
+            f(base, base.add(0x1000));
+            assert_eq!(WATCH_OPENED.load(Ordering::Relaxed), 3);
+            assert!(std::slice::from_raw_parts(base, 0x1000).iter().all(|&b| b == 0));
+
+            RemoveVectoredExceptionHandler(veh);
+            WATCH_BASE.store(0, Ordering::Release);
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn clwb_patches_atomically_with_null_pointer_nop_and_retries() {
+        // 1) Executing `66 0F 1F 30` (patched `clwb [rax]`) with rax = 0 (NULL) must NOT fault!
+        let patched_clwb = [0x66, 0x0F, 0x1F, 0x30, 0xC3];
+        let buf = ExecBuf::new(&patched_clwb);
+        // SAFETY: `buf.ptr` executes a 4-byte memory-operand NOP with rax = 0 and returns.
+        unsafe {
+            let f: unsafe extern "win64" fn() = std::mem::transmute(buf.ptr);
+            std::arch::asm!("call {f}", f = in(reg) f, in("rax") 0usize, clobber_abi("win64"));
+        }
+
+        // 2) `emulate` on unpatched `66 0F AE 30` (clwb [rax]) atomically flips 0xAE -> 0x1F only.
+        let clwb = [0x66, 0x0F, 0xAE, 0x30, 0xC3];
+        let clwb_buf = ExecBuf::new(&clwb);
+        // SAFETY: valid CONTEXT pointing at clwb_buf.
+        unsafe {
+            let mut ctx: CONTEXT = std::mem::zeroed();
+            ctx.Rip = clwb_buf.ptr as u64;
+            assert_eq!(emulate(&mut ctx), CONTINUE_EXECUTION);
+            assert_eq!(ctx.Rip, clwb_buf.ptr as u64 + 4);
+            assert_eq!(clwb_buf.bytes(), &[0x66, 0x0F, 0x1F, 0x30, 0xC3]);
+            assert_eq!(clwb_buf.protect(), PAGE_EXECUTE_READ);
+
+            // 3) Already-patched `66 0F 1F 30` retries at same Rip.
+            ctx.Rip = clwb_buf.ptr as u64;
+            assert_eq!(emulate(&mut ctx), CONTINUE_EXECUTION);
+            assert_eq!(ctx.Rip, clwb_buf.ptr as u64);
+        }
     }
 
     #[test]

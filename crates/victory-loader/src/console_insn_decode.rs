@@ -35,6 +35,9 @@ pub enum ClzeroLoop {
         is_64bit: bool,
         /// `dec` leaves CF unchanged; `sub`/`add` updates CF.
         is_dec: bool,
+        /// When `is_dec == true`, CF left by the pointer step (`Some(false)` for `add +0x40`,
+        /// `Some(true)` for `sub -0x40`, `None` for `lea` preserving pre-loop CF).
+        dec_cf: Option<bool>,
         above: bool,
         /// True for `add cnt, -step`; false for `sub cnt, step`.
         is_add_neg: bool,
@@ -65,9 +68,10 @@ pub enum ConsoleOnly {
     /// `monitorx` / `mwaitx`: a wait the emulation skips or patches to `0F 1F FA/FB`
     Monitorx,
     Mwaitx,
-    /// Already-patched `monitorx`/`mwaitx` (`[prefixes..., 0F, 1F, FA|FB]`) seen if another
-    /// thread faulted right before the atomic byte patch landed: retry at the same `Rip`.
-    PatchedWait,
+    /// Already-patched `monitorx`/`mwaitx` (`[prefixes..., 0F, 1F, FA|FB]`) or `clwb`
+    /// (`[prefixes..., 0F, 1F, /6 mem]`) seen if another thread faulted right before the atomic
+    /// 1-byte patch landed: retry at the same `Rip`.
+    PatchedInsn,
     /// `rdpid r64`: TSC_AUX (the processor number) into the register (CONTEXT order: rax, rcx,
     /// rdx, rbx, rsp, rbp, rsi, rdi, r8..r15)
     Rdpid(u8),
@@ -166,15 +170,23 @@ fn skip_nops(b: &[u8]) -> usize {
     off
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtrStepFlags {
+    /// `lea`: leaves all `EFlags` unchanged.
+    Unchanged,
+    /// `add reg, 0x40` (`false`) or `sub reg, -0x40` (`true`) when non-wrapping.
+    SetsCf(bool),
+}
+
 /// Decodes a 64-bit `+0x40` pointer advance (`add reg, 0x40`, `sub reg, -0x40`, or
-/// `lea reg, [reg + 0x40]`). Returns `(reg, modifies_flags, len)`.
-fn decode_ptr_step64(b: &[u8]) -> Option<(u8, bool, usize)> {
+/// `lea reg, [reg + 0x40]`). Returns `(reg, flag_effect, len)`.
+fn decode_ptr_step64(b: &[u8]) -> Option<(u8, PtrStepFlags, usize)> {
     let rex = *b.first()?;
     if rex == 0x48 && b.get(1..6) == Some(&[0x05, 0x40, 0x00, 0x00, 0x00]) {
-        return Some((0, true, 6));
+        return Some((0, PtrStepFlags::SetsCf(false), 6));
     }
     if rex == 0x48 && b.get(1..6) == Some(&[0x2D, 0xC0, 0xFF, 0xFF, 0xFF]) {
-        return Some((0, true, 6));
+        return Some((0, PtrStepFlags::SetsCf(true), 6));
     }
     if !(0x48..=0x4F).contains(&rex) {
         return None;
@@ -186,7 +198,8 @@ fn decode_ptr_step64(b: &[u8]) -> Option<(u8, bool, usize)> {
             let reg = (modrm & 7) | ((rex & 1) << 3);
             let sub_op = (modrm >> 3) & 7;
             match (sub_op, *b.get(3)?) {
-                (0, 0x40) | (5, 0xC0) => Some((reg, true, 4)),
+                (0, 0x40) => Some((reg, PtrStepFlags::SetsCf(false), 4)),
+                (5, 0xC0) => Some((reg, PtrStepFlags::SetsCf(true), 4)),
                 _ => None,
             }
         }
@@ -195,8 +208,8 @@ fn decode_ptr_step64(b: &[u8]) -> Option<(u8, bool, usize)> {
             let sub_op = (modrm >> 3) & 7;
             let imm = b.get(3..7)?;
             match sub_op {
-                0 if imm == [0x40, 0x00, 0x00, 0x00] => Some((reg, true, 7)),
-                5 if imm == [0xC0, 0xFF, 0xFF, 0xFF] => Some((reg, true, 7)),
+                0 if imm == [0x40, 0x00, 0x00, 0x00] => Some((reg, PtrStepFlags::SetsCf(false), 7)),
+                5 if imm == [0xC0, 0xFF, 0xFF, 0xFF] => Some((reg, PtrStepFlags::SetsCf(true), 7)),
                 _ => None,
             }
         }
@@ -216,9 +229,9 @@ fn decode_ptr_step64(b: &[u8]) -> Option<(u8, bool, usize)> {
                 3
             };
             if md == 1 {
-                (*b.get(disp_at)? == 0x40).then_some((reg, false, disp_at + 1))
+                (*b.get(disp_at)? == 0x40).then_some((reg, PtrStepFlags::Unchanged, disp_at + 1))
             } else {
-                (b.get(disp_at..disp_at + 4)? == [0x40, 0x00, 0x00, 0x00]).then_some((reg, false, disp_at + 4))
+                (b.get(disp_at..disp_at + 4)? == [0x40, 0x00, 0x00, 0x00]).then_some((reg, PtrStepFlags::Unchanged, disp_at + 4))
             }
         }
         _ => None,
@@ -352,7 +365,7 @@ fn decode_clzero_loop(code: &[u8], i: usize) -> Option<(ClzeroLoop, usize)> {
     let mut pos = i + 3;
     pos += skip_nops(&code[pos..]);
 
-    if let Some((ptr_reg, _, step_len)) = decode_ptr_step64(&code[pos..]) {
+    if let Some((ptr_reg, ptr_flags, step_len)) = decode_ptr_step64(&code[pos..]) {
         pos += step_len;
         pos += skip_nops(&code[pos..]);
 
@@ -370,6 +383,9 @@ fn decode_clzero_loop(code: &[u8], i: usize) -> Option<(ClzeroLoop, usize)> {
                 return None;
             }
             let (end_reg, ptr_lhs) = match_cmp_loop_regs(lhs, rhs, ptr_reg)?;
+            if end_reg == 0 {
+                return None;
+            }
             pos += clen;
             pos += skip_nops(&code[pos..]);
             if !saw_mov {
@@ -404,7 +420,11 @@ fn decode_clzero_loop(code: &[u8], i: usize) -> Option<(ClzeroLoop, usize)> {
         }
         pos += cnt.len;
         pos += skip_nops(&code[pos..]);
-        return finish_cnt_loop(code, pos, cnt, true);
+        let dec_cf = match ptr_flags {
+            PtrStepFlags::Unchanged => None,
+            PtrStepFlags::SetsCf(cf) => Some(cf),
+        };
+        return finish_cnt_loop(code, pos, cnt, true, dec_cf);
     }
 
     // Counter step before `lea rax, [rax + 0x40]` (or before `add rax, 0x40` + `cmp`)
@@ -414,16 +434,16 @@ fn decode_clzero_loop(code: &[u8], i: usize) -> Option<(ClzeroLoop, usize)> {
     }
     pos += cnt.len;
     pos += skip_nops(&code[pos..]);
-    let (ptr_reg, ptr_modifies_flags, step_len) = decode_ptr_step64(&code[pos..])?;
+    let (ptr_reg, ptr_flags, step_len) = decode_ptr_step64(&code[pos..])?;
     if ptr_reg != 0 {
         return None;
     }
     pos += step_len;
     pos += skip_nops(&code[pos..]);
-    finish_cnt_loop(code, pos, cnt, !ptr_modifies_flags)
+    finish_cnt_loop(code, pos, cnt, ptr_flags == PtrStepFlags::Unchanged, None)
 }
 
-fn finish_cnt_loop(code: &[u8], mut pos: usize, cnt: CntStep, flags_live: bool) -> Option<(ClzeroLoop, usize)> {
+fn finish_cnt_loop(code: &[u8], mut pos: usize, cnt: CntStep, flags_live: bool, dec_cf: Option<bool>) -> Option<(ClzeroLoop, usize)> {
     if cnt.delta < 0 {
         if !flags_live {
             return None;
@@ -431,7 +451,7 @@ fn finish_cnt_loop(code: &[u8], mut pos: usize, cnt: CntStep, flags_live: bool) 
         let (jcc, total) = decode_jcc_back(&code[pos..], pos)?;
         let above = match jcc {
             0x75 => false,
-            0x77 if !cnt.is_dec => true,
+            0x77 if !cnt.is_dec && !cnt.is_add_neg => true,
             _ => return None,
         };
         return Some((
@@ -440,6 +460,7 @@ fn finish_cnt_loop(code: &[u8], mut pos: usize, cnt: CntStep, flags_live: bool) 
                 step: (-cnt.delta) as u8,
                 is_64bit: cnt.is_64bit,
                 is_dec: cnt.is_dec,
+                dec_cf: cnt.is_dec.then_some(dec_cf).flatten(),
                 above,
                 is_add_neg: cnt.is_add_neg,
             },
@@ -511,8 +532,12 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
         (0x01, Some(0xFD)) => Some((ConsoleOnly::Rdpru, i + 3)),
         (0x01, Some(0xFA)) => Some((ConsoleOnly::Monitorx, i + 3)),
         (0x01, Some(0xFB)) => Some((ConsoleOnly::Mwaitx, i + 3)),
-        // Already-patched `monitorx`/`mwaitx` (`0F 01 FA/FB` -> `0F 1F FA/FB`).
-        (0x1F, Some(0xFA | 0xFB)) => Some((ConsoleOnly::PatchedWait, i + 3)),
+        // Already-patched `monitorx`/`mwaitx` (`0F 01 FA/FB` -> `0F 1F FA/FB`) or `clwb`
+        // (`66 [REX] 0F AE /6` -> `66 [REX] 0F 1F /6`).
+        (0x1F, Some(0xFA | 0xFB)) => Some((ConsoleOnly::PatchedInsn, i + 3)),
+        (0x1F, Some(m)) if p66 && (m >> 3) & 7 == 6 && m >> 6 != 3 => {
+            Some((ConsoleOnly::PatchedInsn, i + 2 + modrm_len(&code[i + 2..])?))
+        }
         (0x0B, _) => Some((ConsoleOnly::Ud2, i + 2)),
         // SSE4a: register operands only (ModRM mod 3); REX.R extends reg, REX.B rm
         // (the last of F2 / F3 decides: F2 INSERTQ, F3 #UD; neither with 66: EXTRQ)
@@ -535,6 +560,20 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
         (0xC7, Some(m)) if pf3 && (m >> 3) & 7 == 7 && m >> 6 == 3 => Some((ConsoleOnly::Rdpid((m & 7) | (rex & 1) << 3), i + 3)),
         _ => None,
     }
+}
+
+/// Returns the byte offset of the second opcode byte (`0x01` or `0xAE`) inside a decoded
+/// instruction starting with `code`, or `None` if `code` does not begin with a patchable
+/// `0F (01|AE)` opcode after its prefixes.
+pub fn opcode_byte_offset(code: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while let Some(&b) = code.get(i) {
+        match b {
+            0x66 | 0xF2 | 0xF3 | 0x2E | 0x3E | 0x26 | 0x36 | 0x64 | 0x65 | 0x67 | 0x40..=0x4F => i += 1,
+            _ => break,
+        }
+    }
+    (*code.get(i)? == 0x0F && matches!(code.get(i + 1), Some(0x01 | 0xAE))).then_some(i + 1)
 }
 
 #[cfg(test)]
@@ -579,9 +618,13 @@ mod tests {
         assert_eq!(decode(&[0x0F, 0x01, 0xFD]), Some((ConsoleOnly::Rdpru, 3)));
         assert_eq!(decode(&[0x0F, 0x01, 0xFA]), Some((ConsoleOnly::Monitorx, 3)));
         assert_eq!(decode(&[0x0F, 0x01, 0xFB]), Some((ConsoleOnly::Mwaitx, 3)));
-        assert_eq!(decode(&[0x0F, 0x1F, 0xFA]), Some((ConsoleOnly::PatchedWait, 3)));
-        assert_eq!(decode(&[0x0F, 0x1F, 0xFB]), Some((ConsoleOnly::PatchedWait, 3)));
-        assert_eq!(decode(&[0x67, 0x48, 0x0F, 0x1F, 0xFA]), Some((ConsoleOnly::PatchedWait, 5)));
+        assert_eq!(decode(&[0x0F, 0x1F, 0xFA]), Some((ConsoleOnly::PatchedInsn, 3)));
+        assert_eq!(decode(&[0x0F, 0x1F, 0xFB]), Some((ConsoleOnly::PatchedInsn, 3)));
+        assert_eq!(decode(&[0x67, 0x48, 0x0F, 0x1F, 0xFA]), Some((ConsoleOnly::PatchedInsn, 5)));
+        assert_eq!(decode(&[0x66, 0x0F, 0x1F, 0x30]), Some((ConsoleOnly::PatchedInsn, 4)));
+        assert_eq!(decode(&[0x66, 0x41, 0x0F, 0x1F, 0x74, 0x24, 0x08]), Some((ConsoleOnly::PatchedInsn, 7)));
+        assert_eq!(decode(&[0x0F, 0x1F, 0x30]), None);
+        assert_eq!(decode(&[0x66, 0x0F, 0x1F, 0x38]), None);
         assert_eq!(decode(&[0x0F, 0x1F, 0x00]), None);
         assert_eq!(decode(&[0xF3, 0x0F, 0x1E, 0xFA]), None);
         assert_eq!(decode(&[0x0F, 0x0B]), Some((ConsoleOnly::Ud2, 2)));
@@ -693,7 +736,15 @@ mod tests {
         assert_eq!(
             decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x83, 0xE9, 0x01, 0x75, 0xF4]),
             Some((
-                ConsoleOnly::ClzeroLoop(ClzeroLoop::CountDown { cnt_reg: 1, step: 1, is_64bit: false, is_dec: false, above: false, is_add_neg: false }),
+                ConsoleOnly::ClzeroLoop(ClzeroLoop::CountDown {
+                    cnt_reg: 1,
+                    step: 1,
+                    is_64bit: false,
+                    is_dec: false,
+                    dec_cf: None,
+                    above: false,
+                    is_add_neg: false,
+                }),
                 12,
             ))
         );
@@ -701,7 +752,46 @@ mod tests {
         assert_eq!(
             decode(&[0x0F, 0x01, 0xFC, 0x48, 0xFF, 0xC9, 0x48, 0x8D, 0x40, 0x40, 0x75, 0xF4]),
             Some((
-                ConsoleOnly::ClzeroLoop(ClzeroLoop::CountDown { cnt_reg: 1, step: 1, is_64bit: true, is_dec: true, above: false, is_add_neg: false }),
+                ConsoleOnly::ClzeroLoop(ClzeroLoop::CountDown {
+                    cnt_reg: 1,
+                    step: 1,
+                    is_64bit: true,
+                    is_dec: true,
+                    dec_cf: None,
+                    above: false,
+                    is_add_neg: false,
+                }),
+                12,
+            ))
+        );
+        // add rax, 0x40; dec rcx; jne (dec_cf = Some(false)) and sub rax, -0x40; dec rcx; jne (dec_cf = Some(true))
+        assert_eq!(
+            decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0xFF, 0xC9, 0x75, 0xF4]),
+            Some((
+                ConsoleOnly::ClzeroLoop(ClzeroLoop::CountDown {
+                    cnt_reg: 1,
+                    step: 1,
+                    is_64bit: true,
+                    is_dec: true,
+                    dec_cf: Some(false),
+                    above: false,
+                    is_add_neg: false,
+                }),
+                12,
+            ))
+        );
+        assert_eq!(
+            decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xE8, 0xC0, 0x48, 0xFF, 0xC9, 0x75, 0xF4]),
+            Some((
+                ConsoleOnly::ClzeroLoop(ClzeroLoop::CountDown {
+                    cnt_reg: 1,
+                    step: 1,
+                    is_64bit: true,
+                    is_dec: true,
+                    dec_cf: Some(true),
+                    above: false,
+                    is_add_neg: false,
+                }),
                 12,
             ))
         );
@@ -709,7 +799,31 @@ mod tests {
         assert_eq!(
             decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x49, 0x83, 0xE8, 0x40, 0x77, 0xF3]),
             Some((
-                ConsoleOnly::ClzeroLoop(ClzeroLoop::CountDown { cnt_reg: 8, step: 64, is_64bit: true, is_dec: false, above: true, is_add_neg: false }),
+                ConsoleOnly::ClzeroLoop(ClzeroLoop::CountDown {
+                    cnt_reg: 8,
+                    step: 64,
+                    is_64bit: true,
+                    is_dec: false,
+                    dec_cf: None,
+                    above: true,
+                    is_add_neg: false,
+                }),
+                13,
+            ))
+        );
+        // add r8, -0x40; jne is valid
+        assert_eq!(
+            decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x49, 0x83, 0xC0, 0xC0, 0x75, 0xF3]),
+            Some((
+                ConsoleOnly::ClzeroLoop(ClzeroLoop::CountDown {
+                    cnt_reg: 8,
+                    step: 64,
+                    is_64bit: true,
+                    is_dec: false,
+                    dec_cf: None,
+                    above: false,
+                    is_add_neg: true,
+                }),
                 13,
             ))
         );
@@ -745,5 +859,17 @@ mod tests {
         assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x48, 0xFF, 0xC9, 0x48, 0x83, 0xC0, 0x40, 0x75, 0xF4]), Some((ConsoleOnly::Clzero, 3)));
         // 7) cmp rdx, rax; jb (opposite comparison direction)
         assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xC2, 0x72, 0xF4]), Some((ConsoleOnly::Clzero, 3)));
+        // 8) add cnt, -step; ja (CF semantics are inverted vs sub cnt, step)
+        assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x49, 0x83, 0xC0, 0xC0, 0x77, 0xF3]), Some((ConsoleOnly::Clzero, 3)));
+        assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x83, 0xC1, 0xFF, 0x77, 0xF4]), Some((ConsoleOnly::Clzero, 3)));
+        // 9) non-rax PtrCmp comparing against rax (`mov rax, r8` overwrites rax each pass)
+        assert_eq!(
+            decode(&[0x0F, 0x01, 0xFC, 0x49, 0x83, 0xC0, 0x40, 0x4C, 0x89, 0xC0, 0x49, 0x39, 0xC0, 0x72, 0xF1]),
+            Some((ConsoleOnly::Clzero, 3))
+        );
+        assert_eq!(
+            decode(&[0x0F, 0x01, 0xFC, 0x49, 0x83, 0xC0, 0x40, 0x4C, 0x89, 0xC0, 0x49, 0x39, 0xC0, 0x76, 0xF1]),
+            Some((ConsoleOnly::Clzero, 3))
+        );
     }
 }
