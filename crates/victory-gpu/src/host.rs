@@ -1808,13 +1808,84 @@ struct CardPlan {
     lists: Vec<(bool, Prelude)>,
 }
 
+#[derive(Clone, Copy)]
+struct Fill {
+    dst: usize,
+    src: usize,
+    len: usize,
+}
+
+impl Fill {
+    fn run(self) {
+        copy_mapped(self.dst as *mut u8, self.src as *const u8, self.len, false);
+    }
+}
+
+/// Worker count for independent runs of upload fills at submission
+/// (`VICTORY_FILL_WORKERS`, default 4; `1` runs serially).
+fn fill_workers() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::env::var("VICTORY_FILL_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 6)
+    })
+}
+
+const FILLS_PER_JOB: usize = 128;
+
+/// Increasing scratch allocations have distinct destinations. A source that
+/// intersects the destination span (or an overflowing range) stays serial.
+fn independent_fills(fills: &[Fill]) -> bool {
+    let Some(first) = fills.first() else {
+        return false;
+    };
+    let mut end = first.dst;
+    for fill in fills {
+        let Some(next) = fill.dst.checked_add(fill.len) else {
+            return false;
+        };
+        if fill.dst < end {
+            return false;
+        }
+        end = next;
+    }
+    fills.iter().all(|f| {
+        f.src
+            .checked_add(f.len)
+            .is_some_and(|src_end| f.src >= end || src_end <= first.dst)
+    })
+}
+
+/// Run a contiguous series of fills. The pool joins before the next step
+/// can access title memory, release scratch, or send the list to the card.
+fn run_fills(fills: &[Fill], workers: usize) {
+    let jobs = workers.min(fills.len() / FILLS_PER_JOB);
+    if jobs > 1 && independent_fills(fills) {
+        let queued = fills
+            .chunks(fills.len().div_ceil(jobs))
+            .map(|chunk| {
+                let owned = chunk.to_vec();
+                Box::new(move || owned.into_iter().for_each(Fill::run)) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(queued);
+    } else {
+        fills.iter().copied().for_each(Fill::run);
+    }
+}
+
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
     /// A copy of title memory into the list's own upload memory.
-    Fill(usize, usize, usize),
+    Fill(Fill),
+    /// A contiguous batch of upload fills eligible for parallel execution.
+    Fills(Vec<Fill>),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -1839,6 +1910,8 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Start index of the current consecutive `Step::Fill` run.
+    fill_start: usize,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -1887,6 +1960,7 @@ impl Deferred {
             self.upload_bytes = 0;
         }
         self.copies.clear();
+        self.fill_start = 0;
         self.kept.clear();
         self.refreshed.clear();
         self.gpu_written.clear();
@@ -2350,16 +2424,21 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
+                Step::Fill(_) | Step::Fills(_) => {
+                    let fills = match step {
+                        Step::Fill(f) => std::slice::from_ref(f),
+                        Step::Fills(group) => group.as_slice(),
+                        _ => unreachable!(),
+                    };
+                    if let Some(hit) = fills.iter().find(|f| touches(written, f.src, f.src + f.len)) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                             let n = LOGGED.fetch_add(1, Ordering::Relaxed);
                             if n < 4 || n.is_multiple_of(500) {
                                 tracing::info!(
-                                    src = format_args!("{src:#x}"),
-                                    len,
+                                    src = format_args!("{:#x}", hit.src),
+                                    len = hit.len,
                                     count = n + 1,
                                     "late settle triggered by Step::Fill overlapping shader writes"
                                 );
@@ -5731,9 +5810,35 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+        let fill = Fill {
+            dst: dst as usize,
+            src: src as usize,
+            len,
+        };
+        let mut deferred = self.deferred();
+        let workers = fill_workers();
+        if workers > 1 {
+            match deferred.copies.last_mut() {
+                Some(Step::Fills(group)) if group.len() < 4096 => {
+                    group.push(fill);
+                    return;
+                }
+                Some(Step::Fill(_)) => {}
+                _ => deferred.fill_start = deferred.copies.len(),
+            }
+            if deferred.copies.len() - deferred.fill_start + 1 == 2 * FILLS_PER_JOB {
+                let start = deferred.fill_start;
+                let mut group = Vec::with_capacity(2 * FILLS_PER_JOB);
+                for step in deferred.copies.drain(start..) {
+                    let Step::Fill(f) = step else { unreachable!() };
+                    group.push(f);
+                }
+                group.push(fill);
+                deferred.copies.push(Step::Fills(group));
+                return;
+            }
+        }
+        deferred.copies.push(Step::Fill(fill));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -5995,14 +6100,24 @@ impl HostList {
                     }
                     len
                 }
-                &Step::Fill(dst, src, len) => {
+                &Step::Fill(fill) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
+                        add(C::CopyBytes, fill.len as u64);
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
+                    fill.run();
+                    fill.len
+                }
+                Step::Fills(group) => {
+                    let total: usize = group.iter().map(|f| f.len).sum();
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Copies, group.len() as u64);
+                        add(C::CopyBytes, total as u64);
+                    }
+                    run_fills(group, fill_workers());
+                    total
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
