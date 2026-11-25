@@ -873,6 +873,9 @@ pub(crate) struct HostList {
     /// Buffers for clamped indirect arguments when this list holds the
     /// clamps of the list after it (`clamp_room`).
     clamp_chunks: Mutex<ClampChunks>,
+    /// Scattered indirect clamps queued for GPU gather-clamp batching
+    /// (`crate::indirect::GatherState`), flushed before `clamp_end`.
+    gather: Mutex<crate::indirect::GatherState>,
     /// Whether unordered shader writes may be pending in this list since its
     /// last global UAV barrier (`barrier_merge`). Starts `true` after reset so
     /// the first barrier in a list stays conservative across list boundaries.
@@ -2396,6 +2399,74 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     None
 }
 
+/// Whether two consecutive ready submission parts (`earlier` followed by `next`)
+/// can be coalesced into one `ExecuteCommandLists` submission without violating
+/// copy-back, readback, bottom-of-pipe write, or cross-shadow aliasing order.
+pub(crate) fn parts_can_join(earlier: &[&HostList], next: &[&HostList]) -> bool {
+    let mut gpu_writes: Vec<(usize, usize)> = Vec::new();
+    let mut gpu_shadows: Vec<(usize, usize, usize)> = Vec::new();
+    let mut cpu_writes: Vec<(usize, usize)> = Vec::new();
+    for list in earlier {
+        let deferred = list.deferred();
+        // GPU->CPU readbacks write title memory after `earlier` finishes.
+        if !deferred.backs.is_empty() {
+            return false;
+        }
+        for &(at, _, bytes) in &deferred.writes {
+            if bytes > 0 {
+                cpu_writes.push((at, at.saturating_add(bytes)));
+            }
+        }
+        for step in &deferred.copies {
+            if let Step::GpuWrite(shadow, address, len) = step
+                && *len > 0
+            {
+                let end = address.saturating_add(*len);
+                gpu_writes.push((*address, end));
+                gpu_shadows.push((std::sync::Arc::as_ptr(shadow) as usize, *address, end));
+            }
+        }
+    }
+    if gpu_writes.is_empty() && cpu_writes.is_empty() {
+        return true;
+    }
+    let mut merged_gpu = Vec::new();
+    join_ranges(&mut merged_gpu, gpu_writes);
+    let mut merged_cpu = Vec::new();
+    join_ranges(&mut merged_cpu, cpu_writes);
+
+    if !merged_gpu.is_empty() && blocked_by(&merged_gpu, next, false).is_some() {
+        return false;
+    }
+    if !merged_cpu.is_empty() && blocked_by(&merged_cpu, next, false).is_some() {
+        return false;
+    }
+    for list in next {
+        let deferred = list.deferred();
+        for step in &deferred.copies {
+            if let Step::Refresh(shadow, address, len) = step
+                && *len > 0
+            {
+                let end = address.saturating_add(*len);
+                // Bottom-of-pipe CPU writes in `earlier` must land before `next` refreshes them.
+                if !merged_cpu.is_empty() && touches(&merged_cpu, *address, end) {
+                    return false;
+                }
+                // Different host shadow buffers aliasing the same title range need
+                // `earlier`'s GPU copy-back before `next`'s shadow refreshes from CPU memory.
+                let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+                if gpu_shadows
+                    .iter()
+                    .any(|&(s_ptr, lo, hi)| s_ptr != ptr && *address < hi && lo < end)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
@@ -3229,6 +3300,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 writes: std::sync::atomic::AtomicU64::new(0),
                 clamp_chunks: Mutex::default(),
+                gather: Mutex::default(),
                 uav_pending: std::sync::atomic::AtomicBool::new(true),
                 uav_synced: Mutex::default(),
                 uav_synced_any: std::sync::atomic::AtomicBool::new(false),
@@ -5186,6 +5258,7 @@ impl HostList {
             chunks.at = 0;
             chunks.barrier = false;
         }
+        self.gather.lock().unwrap_or_else(|e| e.into_inner()).reset();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
@@ -5639,9 +5712,15 @@ impl HostList {
         Some((buffer, 0))
     }
 
+    /// Access to this list's scattered indirect gather-clamp batch state.
+    pub(crate) fn gather_state(&self) -> &Mutex<crate::indirect::GatherState> {
+        &self.gather
+    }
+
     /// The clamped arguments written so far become readable as indirect
     /// arguments by the lists after this one.
     pub(crate) fn clamp_end(&self) {
+        crate::indirect::flush_gather(self, false);
         let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
         let used = chunks.used;
         let barriers: Vec<_> = chunks.all[..used]

@@ -179,38 +179,7 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
+    let code = compile_blob(SOURCE, s!("clamp"), 0)?;
     // SAFETY: the blob's own bytes; the root signature is inside the shader.
     unsafe {
         let bytes =
@@ -594,6 +563,1146 @@ fn record_clamp_waits(
     true
 }
 
+/// `VICTORY_INDIRECT_GATHER` (on by default, `=0` disables): batches scattered
+/// small indirect argument clamps recorded into a hoisted clamp list into a
+/// single `[numthreads(64, 1, 1)]` GPU compute gather-clamp pass (or a 2-pass
+/// parallel gather + exact ordered budget pass for many distinct source
+/// buffers), replacing per-record compute dispatches and Mode 7 UAV barriers.
+pub(crate) fn gather_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_INDIRECT_GATHER").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!(
+                "scattered indirect gather-clamp batching off (VICTORY_INDIRECT_GATHER=0)"
+            );
+        }
+        on
+    })
+}
+
+/// Maximum record count per indirect call eligible for gather-clamp batching.
+/// Calls with more records already fill most of a 64-lane compute wave on
+/// their own and stay on the direct dispatch path.
+const GATHER_MAX_RECORDS: u32 = 32;
+/// Maximum expanded records buffered in a single gather flush.
+const GATHER_BATCH_MAX_ITEMS: usize = 2048;
+/// Maximum distinct source/count buffers (SRVs) in a single gather flush.
+const GATHER_BATCH_MAX_SRVS: usize = 512;
+/// Maximum distinct destination chunk buffers (UAVs) in a single gather flush.
+const GATHER_BATCH_MAX_UAVS: usize = 64;
+/// Descriptor slots per per-list shader-visible gather heap.
+const GATHER_HEAP_SLOTS: u32 = 2048;
+/// Threshold in contiguous uniform groups below which single-pass `Dispatch(1,1,1)`
+/// runs directly with zero internal UAV barriers and no `costs` scratch buffer.
+const GATHER_SINGLE_PASS_MAX_GROUPS: usize = 8;
+
+/// Single-pass `[numthreads(64, 1, 1)]` gather-clamp shader for batches whose
+/// items form at most `GATHER_SINGLE_PASS_MAX_GROUPS` contiguous uniform
+/// `(src_idx, count_idx, dst_idx)` groups. All descriptor table indices are
+/// dynamically uniform across the threadgroup (SM 5.1 compliant), and budget
+/// charging runs in strict item order via a 64-wide saturating prefix sum.
+const GATHER_SINGLE_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), SRV(t1), UAV(u0), DescriptorTable(SRV(t0, space=1, numDescriptors=unbounded)), DescriptorTable(UAV(u0, space=1, numDescriptors=unbounded))"
+cbuffer Batch : register(b0) {
+    uint num_groups;
+    uint total_items;
+};
+ByteAddressBuffer items : register(t0);
+ByteAddressBuffer groups : register(t1);
+RWByteAddressBuffer budget : register(u0);
+ByteAddressBuffer srvs[] : register(t0, space1);
+RWByteAddressBuffer uavs[] : register(u0, space1);
+
+static const uint BUDGET = 1u << 27;
+static const uint CAP = BUDGET + 1u;
+static const uint GROUPS = 1u << 20;
+static const uint SPLIT = 2u;
+
+groupshared uint s_b0;
+groupshared uint s_sum[64];
+
+uint sat_add(uint a, uint b) {
+    return (a >= CAP || CAP - a <= b) ? CAP : (a + b);
+}
+
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 gtid : SV_GroupThreadID) {
+    uint tid = gtid.x;
+    if (tid == 0u) {
+        uint b0;
+        budget.InterlockedOr(0, 0, b0);
+        s_b0 = b0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint b0 = s_b0;
+    uint rem = (b0 >= BUDGET) ? 0u : (BUDGET - b0);
+    uint running = 0u;
+
+    for (uint g = 0u; g < num_groups; g++) {
+        uint4 grp = groups.Load4(g * 16u);
+        uint first = grp.x;
+        uint grp_count = grp.y;
+        uint src_idx = grp.z;
+        uint count_idx = grp.w & 0xFFFFu;
+        uint dst_idx = grp.w >> 16u;
+
+        bool active = tid < grp_count;
+        uint kind = 0u;
+        uint stride = 0u;
+        uint rec_idx = 0u;
+        uint flags = 0u;
+        uint src_at = 0u;
+        uint count_at = 0u;
+        uint dst_at = 0u;
+        uint cost = 0u;
+        uint2 draw_counts = uint2(0u, 0u);
+        uint3 dgroups = uint3(0u, 0u, 0u);
+
+        if (active) {
+            uint item_off = (first + tid) * 32u;
+            uint4 w0 = items.Load4(item_off);
+            uint4 w1 = items.Load4(item_off + 16u);
+            kind = w0.x;
+            stride = w0.y;
+            rec_idx = w0.z;
+            flags = w0.w;
+            src_at = w1.x;
+            count_at = w1.y;
+            dst_at = w1.z;
+            if ((flags & 1u) != 0u) {
+                uint cnt = srvs[count_idx].Load(count_at);
+                if (rec_idx >= cnt) {
+                    active = false;
+                }
+            }
+        }
+        if (active) {
+            bool ahead = (flags & 2u) != 0u;
+            bool split = (flags & 4u) != 0u;
+            if (kind <= 1u) {
+                uint2 asked = srvs[src_idx].Load2(src_at);
+                if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
+                    asked = uint2(0u, 0u);
+                }
+                uint count = min(asked.x, 1u << 24);
+                uint instances = min(asked.y, (1u << 26) / max(count, 1u));
+                cost = count * instances;
+                draw_counts = uint2(count, instances);
+            } else if (kind == 2u) {
+                uint3 asked = srvs[src_idx].Load3(src_at);
+                uint3 dg = min(asked, uint3(65535u, 65535u, 65535u));
+                if (split && dg.y <= 1u && dg.z <= 1u && asked.x <= SPLIT * 65535u) {
+                    dg.x = asked.x;
+                }
+                if (dg.z != 0u && dg.x * dg.y > GROUPS / dg.z) {
+                    dg = uint3(0u, 0u, 0u);
+                }
+                cost = dg.x * dg.y * dg.z * 64u;
+                dgroups = dg;
+            } else {
+                uint3 dg = srvs[src_idx].Load3(src_at);
+                if (ahead && dg.x > 65535u) {
+                    dg = uint3(0u, 0u, 0u);
+                }
+                uint was;
+                budget.InterlockedMax(4, dg.x, was);
+                budget.InterlockedAdd(8, min(dg.x, 1u << 24), was);
+                dg = uint3(min(dg.x, 65535u), min(dg.y, 1u), min(dg.z, 1u));
+                cost = dg.x * dg.y * dg.z * 128u;
+                dgroups = dg;
+            }
+        }
+
+        s_sum[tid] = cost;
+        GroupMemoryBarrierWithGroupSync();
+        [unroll]
+        for (uint step = 1u; step < 64u; step <<= 1u) {
+            uint v = s_sum[tid];
+            if (tid >= step) {
+                v = sat_add(v, s_sum[tid - step]);
+            }
+            GroupMemoryBarrierWithGroupSync();
+            s_sum[tid] = v;
+            GroupMemoryBarrierWithGroupSync();
+        }
+        uint inc = sat_add(running, s_sum[tid]);
+        running = sat_add(running, s_sum[63]);
+        GroupMemoryBarrierWithGroupSync();
+        bool over = (cost > 0u) && (inc > rem);
+
+        if (active) {
+            bool split = (flags & 4u) != 0u;
+            if (kind <= 1u) {
+                if (over) {
+                    draw_counts = uint2(0u, 0u);
+                }
+                uavs[dst_idx].Store2(dst_at, draw_counts);
+                for (uint off = 8u; off < stride; off += 4u) {
+                    uavs[dst_idx].Store(dst_at + off, srvs[src_idx].Load(src_at + off));
+                }
+            } else {
+                if (over) {
+                    dgroups = uint3(0u, 0u, 0u);
+                }
+                if (split) {
+                    for (uint part = 0u; part < SPLIT; part++) {
+                        uint before_g = part * 65535u;
+                        uint x = dgroups.x > before_g ? min(dgroups.x - before_g, 65535u) : 0u;
+                        uavs[dst_idx].Store3(dst_at + part * 12u, uint3(x, dgroups.yz));
+                    }
+                } else {
+                    uavs[dst_idx].Store3(dst_at, dgroups);
+                    for (uint off = 12u; off < stride; off += 4u) {
+                        uavs[dst_idx].Store(dst_at + off, srvs[src_idx].Load(src_at + off));
+                    }
+                }
+            }
+        }
+    }
+
+    if (tid == 0u && b0 < BUDGET && running > 0u) {
+        uint next = (running >= rem) ? BUDGET : (b0 + running);
+        uint prev;
+        budget.InterlockedMax(0, next, prev);
+    }
+}
+"#;
+
+/// Pass 1 of two-pass parallel gather-clamp: runs one 64-lane threadgroup per
+/// uniform `(src_idx, count_idx, dst_idx)` group across all SMs, clamping and
+/// writing arguments in full parallel and storing each record's `cost` at its
+/// original sequence slot `costs[seq]`.
+const GATHER_PASS1_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1), DescriptorTable(SRV(t0, space=1, numDescriptors=unbounded)), DescriptorTable(UAV(u0, space=1, numDescriptors=unbounded))"
+cbuffer Batch : register(b0) {
+    uint num_groups;
+    uint total_items;
+};
+ByteAddressBuffer items : register(t0);
+ByteAddressBuffer groups : register(t1);
+RWByteAddressBuffer budget : register(u0);
+RWByteAddressBuffer costs : register(u1);
+ByteAddressBuffer srvs[] : register(t0, space1);
+RWByteAddressBuffer uavs[] : register(u0, space1);
+
+static const uint GROUPS = 1u << 20;
+static const uint SPLIT = 2u;
+
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint g = gid.x;
+    if (g >= num_groups) return;
+    uint4 grp = groups.Load4(g * 16u);
+    uint first = grp.x;
+    uint grp_count = grp.y;
+    uint tid = gtid.x;
+    if (tid >= grp_count) return;
+
+    uint src_idx = grp.z;
+    uint count_idx = grp.w & 0xFFFFu;
+    uint dst_idx = grp.w >> 16u;
+
+    uint item_off = (first + tid) * 32u;
+    uint4 w0 = items.Load4(item_off);
+    uint4 w1 = items.Load4(item_off + 16u);
+    uint kind = w0.x;
+    uint stride = w0.y;
+    uint rec_idx = w0.z;
+    uint flags = w0.w;
+    uint src_at = w1.x;
+    uint count_at = w1.y;
+    uint dst_at = w1.z;
+    uint seq = w1.w & 0x00FFFFFFu;
+
+    if ((flags & 1u) != 0u) {
+        uint cnt = srvs[count_idx].Load(count_at);
+        if (rec_idx >= cnt) {
+            costs.Store(seq * 4u, 0u);
+            return;
+        }
+    }
+
+    bool ahead = (flags & 2u) != 0u;
+    bool split = (flags & 4u) != 0u;
+    uint cost = 0u;
+
+    if (kind <= 1u) {
+        uint2 asked = srvs[src_idx].Load2(src_at);
+        if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
+            asked = uint2(0u, 0u);
+        }
+        uint count = min(asked.x, 1u << 24);
+        uint instances = min(asked.y, (1u << 26) / max(count, 1u));
+        cost = count * instances;
+        uavs[dst_idx].Store2(dst_at, uint2(count, instances));
+        for (uint off = 8u; off < stride; off += 4u) {
+            uavs[dst_idx].Store(dst_at + off, srvs[src_idx].Load(src_at + off));
+        }
+    } else if (kind == 2u) {
+        uint3 asked = srvs[src_idx].Load3(src_at);
+        uint3 dg = min(asked, uint3(65535u, 65535u, 65535u));
+        if (split && dg.y <= 1u && dg.z <= 1u && asked.x <= SPLIT * 65535u) {
+            dg.x = asked.x;
+        }
+        if (dg.z != 0u && dg.x * dg.y > GROUPS / dg.z) {
+            dg = uint3(0u, 0u, 0u);
+        }
+        cost = dg.x * dg.y * dg.z * 64u;
+        if (split) {
+            for (uint part = 0u; part < SPLIT; part++) {
+                uint before_g = part * 65535u;
+                uint x = dg.x > before_g ? min(dg.x - before_g, 65535u) : 0u;
+                uavs[dst_idx].Store3(dst_at + part * 12u, uint3(x, dg.yz));
+            }
+        } else {
+            uavs[dst_idx].Store3(dst_at, dg);
+            for (uint off = 12u; off < stride; off += 4u) {
+                uavs[dst_idx].Store(dst_at + off, srvs[src_idx].Load(src_at + off));
+            }
+        }
+    } else {
+        uint3 dg = srvs[src_idx].Load3(src_at);
+        if (ahead && dg.x > 65535u) {
+            dg = uint3(0u, 0u, 0u);
+        }
+        uint was;
+        budget.InterlockedMax(4, dg.x, was);
+        budget.InterlockedAdd(8, min(dg.x, 1u << 24), was);
+        dg = uint3(min(dg.x, 65535u), min(dg.y, 1u), min(dg.z, 1u));
+        cost = dg.x * dg.y * dg.z * 128u;
+        uavs[dst_idx].Store3(dst_at, dg);
+        for (uint off = 12u; off < stride; off += 4u) {
+            uavs[dst_idx].Store(dst_at + off, srvs[src_idx].Load(src_at + off));
+        }
+    }
+    costs.Store(seq * 4u, cost);
+}
+"#;
+
+/// Pass 2 of two-pass gather-clamp: computes the exact original-order saturating
+/// prefix sum over `costs[0..total_items]` in 64-wide chunks, updates `budget[0]`,
+/// and (only if budget overflowed) zeroes the exact over-budget records in `uavs[]`
+/// using wave-uniform `dst_idx` from `groups[]`. Shares the root signature with
+/// `GATHER_PASS1_CS`.
+const GATHER_PASS2_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1), DescriptorTable(SRV(t0, space=1, numDescriptors=unbounded)), DescriptorTable(UAV(u0, space=1, numDescriptors=unbounded))"
+cbuffer Batch : register(b0) {
+    uint num_groups;
+    uint total_items;
+};
+ByteAddressBuffer items : register(t0);
+ByteAddressBuffer groups : register(t1);
+RWByteAddressBuffer budget : register(u0);
+RWByteAddressBuffer costs : register(u1);
+RWByteAddressBuffer uavs[] : register(u0, space1);
+
+static const uint BUDGET = 1u << 27;
+static const uint CAP = BUDGET + 1u;
+static const uint SPLIT = 2u;
+
+groupshared uint s_b0;
+groupshared uint s_sum[64];
+
+uint sat_add(uint a, uint b) {
+    return (a >= CAP || CAP - a <= b) ? CAP : (a + b);
+}
+
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 gtid : SV_GroupThreadID) {
+    uint tid = gtid.x;
+    if (tid == 0u) {
+        uint b0;
+        budget.InterlockedOr(0, 0, b0);
+        s_b0 = b0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint b0 = s_b0;
+    uint rem = (b0 >= BUDGET) ? 0u : (BUDGET - b0);
+    uint running = 0u;
+
+    for (uint base = 0u; base < total_items; base += 64u) {
+        uint seq = base + tid;
+        uint c = (seq < total_items) ? costs.Load(seq * 4u) : 0u;
+        s_sum[tid] = c;
+        GroupMemoryBarrierWithGroupSync();
+        [unroll]
+        for (uint step = 1u; step < 64u; step <<= 1u) {
+            uint v = s_sum[tid];
+            if (tid >= step) {
+                v = sat_add(v, s_sum[tid - step]);
+            }
+            GroupMemoryBarrierWithGroupSync();
+            s_sum[tid] = v;
+            GroupMemoryBarrierWithGroupSync();
+        }
+        uint inc = sat_add(running, s_sum[tid]);
+        running = sat_add(running, s_sum[63]);
+        GroupMemoryBarrierWithGroupSync();
+        bool over = (seq < total_items) && (c > 0u) && (inc > rem);
+        if (seq < total_items) {
+            costs.Store(seq * 4u, over ? 1u : 0u);
+        }
+    }
+
+    if (tid == 0u && b0 < BUDGET && running > 0u) {
+        uint next = (running >= rem) ? BUDGET : (b0 + running);
+        uint prev;
+        budget.InterlockedMax(0, next, prev);
+    }
+
+    if (running <= rem) {
+        return;
+    }
+
+    DeviceMemoryBarrierWithGroupSync();
+    for (uint g = 0u; g < num_groups; g++) {
+        uint4 grp = groups.Load4(g * 16u);
+        uint first = grp.x;
+        uint grp_count = grp.y;
+        uint dst_idx = grp.w >> 16u;
+        if (tid < grp_count) {
+            uint item_off = (first + tid) * 32u;
+            uint4 w0 = items.Load4(item_off);
+            uint4 w1 = items.Load4(item_off + 16u);
+            uint seq = w1.w & 0x00FFFFFFu;
+            if (costs.Load(seq * 4u) != 0u) {
+                uint kind = w0.x;
+                uint flags = w0.w;
+                uint dst_at = w1.z;
+                if (kind <= 1u) {
+                    uavs[dst_idx].Store2(dst_at, uint2(0u, 0u));
+                } else if ((flags & 4u) != 0u) {
+                    for (uint part = 0u; part < SPLIT; part++) {
+                        uavs[dst_idx].Store3(dst_at + part * 12u, uint3(0u, 0u, 0u));
+                    }
+                } else {
+                    uavs[dst_idx].Store3(dst_at, uint3(0u, 0u, 0u));
+                }
+            }
+        }
+    }
+}
+"#;
+
+struct GatherClamp {
+    single_root: ID3D12RootSignature,
+    single_pso: ID3D12PipelineState,
+    twopass_root: ID3D12RootSignature,
+    pass1_pso: ID3D12PipelineState,
+    pass2_pso: ID3D12PipelineState,
+}
+
+// SAFETY: D3D12 root signatures and pipeline states are free-threaded.
+unsafe impl Send for GatherClamp {}
+// SAFETY: as above.
+unsafe impl Sync for GatherClamp {}
+
+fn compile_blob(
+    source: &str,
+    name: windows::core::PCSTR,
+    flags: u32,
+) -> windows::core::Result<ID3DBlob> {
+    // Serialize `D3DCompile` calls across threads: `d3dcompiler_47.dll` can
+    // fault when many threads invoke FXC simultaneously.
+    static COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut code: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    // SAFETY: source and entry strings live through `D3DCompile`.
+    let compiled = unsafe {
+        D3DCompile(
+            source.as_ptr().cast(),
+            source.len(),
+            name,
+            None,
+            None,
+            s!("main"),
+            s!("cs_5_1"),
+            flags,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    if let Err(e) = compiled {
+        if let Some(errors) = errors {
+            // SAFETY: the error blob's own bytes.
+            let text = unsafe {
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
+            };
+            let msg = String::from_utf8_lossy(text);
+            tracing::warn!("gather clamp shader compile: {msg}");
+            #[cfg(test)]
+            eprintln!("gather clamp shader compile error:\n{msg}");
+        }
+        return Err(e);
+    }
+    code.ok_or_else(windows::core::Error::empty)
+}
+
+fn make_gather_for(device: &ID3D12Device) -> windows::core::Result<GatherClamp> {
+    // Unbounded UAV descriptor tables require Resource Binding Tier 3.
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    // SAFETY: plain feature query on a live device.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS,
+            (&raw mut opts).cast(),
+            size_of_val(&opts) as u32,
+        )?;
+    }
+    if opts.ResourceBindingTier.0 < D3D12_RESOURCE_BINDING_TIER_3.0 {
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_NOTIMPL,
+        ));
+    }
+    let unbounded =
+        windows::Win32::Graphics::Direct3D::Fxc::D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES;
+    let single_blob = compile_blob(GATHER_SINGLE_CS, s!("gather_single"), unbounded)?;
+    let pass1_blob = compile_blob(GATHER_PASS1_CS, s!("gather_pass1"), unbounded)?;
+    let pass2_blob = compile_blob(GATHER_PASS2_CS, s!("gather_pass2"), unbounded)?;
+    // SAFETY: compiled DXBC blobs with embedded root signatures.
+    unsafe {
+        let slice = |blob: &ID3DBlob| {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        };
+        let single_bytes = slice(&single_blob);
+        let pass1_bytes = slice(&pass1_blob);
+        let pass2_bytes = slice(&pass2_blob);
+        let single_root: ID3D12RootSignature = device.CreateRootSignature(0, single_bytes)?;
+        let single_pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&single_root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: single_bytes.as_ptr().cast(),
+                BytecodeLength: single_bytes.len(),
+            },
+            ..Default::default()
+        })?;
+        let twopass_root: ID3D12RootSignature = device.CreateRootSignature(0, pass1_bytes)?;
+        let pass1_pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&twopass_root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: pass1_bytes.as_ptr().cast(),
+                BytecodeLength: pass1_bytes.len(),
+            },
+            ..Default::default()
+        })?;
+        let pass2_pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&twopass_root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: pass2_bytes.as_ptr().cast(),
+                BytecodeLength: pass2_bytes.len(),
+            },
+            ..Default::default()
+        })?;
+        Ok(GatherClamp {
+            single_root,
+            single_pso,
+            twopass_root,
+            pass1_pso,
+            pass2_pso,
+        })
+    }
+}
+
+fn gather_clamp() -> Option<&'static GatherClamp> {
+    static GATHER: std::sync::OnceLock<Option<GatherClamp>> = std::sync::OnceLock::new();
+    GATHER
+        .get_or_init(|| {
+            let device = &host()?.device;
+            match make_gather_for(device) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "gather-clamp shader unavailable; falling back to per-record clamps"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// One pending expanded record inside [`GatherState`].
+struct PendingItem {
+    kind: u32,
+    stride: u32,
+    rec_idx: u32,
+    flags: u32,
+    src_offset: u32,
+    count_offset: u32,
+    dst_offset: u32,
+    src_idx: u16,
+    count_idx: u16,
+    dst_idx: u16,
+    seq: u32,
+}
+
+/// Stats returned by [`GatherState::flush_on`] for diagnostics and benchmarks.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GatherFlushStats {
+    pub(crate) items: u32,
+    pub(crate) groups: u32,
+    pub(crate) dispatches: u32,
+    pub(crate) barriers: u32,
+    pub(crate) two_pass: bool,
+}
+
+/// Per-`HostList` gather-clamp batching state: accumulates scattered small
+/// indirect clamps and flushes them in a single `[numthreads(64, 1, 1)]`
+/// compute pass (or 2-pass parallel gather + ordered prefix sum), keeping all
+/// referenced descriptors and resources alive until `HostList::reset`.
+#[derive(Default)]
+pub(crate) struct GatherState {
+    pending: Vec<PendingItem>,
+    srvs: Vec<(ID3D12Resource, u32)>,
+    srv_index: std::collections::HashMap<usize, u16>,
+    uavs: Vec<(ID3D12Resource, u32)>,
+    uav_index: std::collections::HashMap<usize, u16>,
+    /// Shader-visible CBV/SRV/UAV descriptor heap reused across list resets.
+    heap: Option<(ID3D12DescriptorHeap, u32)>,
+    heap_used: u32,
+    /// Earlier heaps replaced mid-list when a single list overflows `GATHER_HEAP_SLOTS`,
+    /// kept alive until GPU completion (`reset`).
+    retired_heaps: Vec<ID3D12DescriptorHeap>,
+    /// Source/count/destination resources referenced by flushed batches in this
+    /// list recording, kept alive until `reset` prevents descriptor UAF.
+    kept_resources: Vec<ID3D12Resource>,
+    /// Device-local `DEFAULT` UAV buffer for two-pass per-record `costs`, reused
+    /// across resets.
+    costs: Option<(ID3D12Resource, u32)>,
+    /// Whether `costs` was already written/read in this recording (needs a UAV
+    /// barrier before reuse in a second two-pass flush on the same list).
+    costs_used: bool,
+}
+
+// SAFETY: D3D12 resources and descriptor heaps are free-threaded; `GatherState`
+// is only accessed under its `HostList`'s mutex.
+unsafe impl Send for GatherState {}
+
+impl GatherState {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Clears per-recording batch state after the GPU has finished executing
+    /// this list, keeping the allocated descriptor heap and `costs` buffer for
+    /// reuse on the next recording.
+    pub(crate) fn reset(&mut self) {
+        self.pending.clear();
+        self.srvs.clear();
+        self.srv_index.clear();
+        self.uavs.clear();
+        self.uav_index.clear();
+        self.heap_used = 0;
+        self.retired_heaps.clear();
+        self.kept_resources.clear();
+        self.costs_used = false;
+    }
+
+    fn raw_num_elements(res: &ID3D12Resource, required_end: u64) -> Option<u32> {
+        // SAFETY: live D3D12 buffer resource.
+        let width = unsafe { res.GetDesc().Width };
+        if width < 4 || required_end > width {
+            return None;
+        }
+        let elems = width / 4;
+        (elems <= u64::from(u32::MAX)).then_some(elems as u32)
+    }
+
+    fn would_overflow(&self, records: u32, src: &ID3D12Resource, count: Option<&ID3D12Resource>, dst: &ID3D12Resource) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        if self.pending.len() + records as usize > GATHER_BATCH_MAX_ITEMS {
+            return true;
+        }
+        use windows::core::Interface;
+        let mut extra_srvs = usize::from(!self.srv_index.contains_key(&(src.as_raw() as usize)));
+        if let Some(c) = count
+            && c.as_raw() != src.as_raw()
+            && !self.srv_index.contains_key(&(c.as_raw() as usize))
+        {
+            extra_srvs += 1;
+        }
+        if self.srvs.len() + extra_srvs > GATHER_BATCH_MAX_SRVS {
+            return true;
+        }
+        let extra_uavs = usize::from(!self.uav_index.contains_key(&(dst.as_raw() as usize)));
+        self.uavs.len() + extra_uavs > GATHER_BATCH_MAX_UAVS
+    }
+
+    fn register_srv(&mut self, res: &ID3D12Resource, num_elems: u32) -> u16 {
+        use windows::core::Interface;
+        let key = res.as_raw() as usize;
+        if let Some(&idx) = self.srv_index.get(&key) {
+            return idx;
+        }
+        let idx = self.srvs.len() as u16;
+        self.srvs.push((res.clone(), num_elems));
+        self.srv_index.insert(key, idx);
+        idx
+    }
+
+    fn register_uav(&mut self, res: &ID3D12Resource, num_elems: u32) -> u16 {
+        use windows::core::Interface;
+        let key = res.as_raw() as usize;
+        if let Some(&idx) = self.uav_index.get(&key) {
+            return idx;
+        }
+        let idx = self.uavs.len() as u16;
+        self.uavs.push((res.clone(), num_elems));
+        self.uav_index.insert(key, idx);
+        idx
+    }
+
+    /// Enqueues a validated indirect clamp call whose output slot `(dst, dst_offset)`
+    /// has already been reserved in `UNORDERED_ACCESS`. Returns `false` if the
+    /// offsets or resource sizes do not fit raw 32-bit gather addressing.
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue(
+        &mut self,
+        (src, src_offset): (&ID3D12Resource, u64),
+        count: Option<(&ID3D12Resource, u64)>,
+        (dst, dst_offset): (&ID3D12Resource, u64),
+        (kind, stride, records): (u32, u32, u32),
+        how: u32,
+    ) -> bool {
+        let Some(bytes) = validate_layout((kind, stride, records), src_offset, count.map(|(_, o)| o)) else {
+            return false;
+        };
+        if records == 0 || records > GATHER_MAX_RECORDS {
+            return false;
+        }
+        let dst_bytes = if (how & IN_PARTS) != 0 {
+            u64::from(SPLIT) * PART_BYTES
+        } else {
+            bytes
+        };
+        let Some(src_end) = src_offset.checked_add(bytes).filter(|&e| e <= u64::from(u32::MAX)) else {
+            return false;
+        };
+        let Some(dst_end) = dst_offset.checked_add(dst_bytes).filter(|&e| e <= u64::from(u32::MAX)) else {
+            return false;
+        };
+        let Some(src_elems) = Self::raw_num_elements(src, src_end) else {
+            return false;
+        };
+        let Some(dst_elems) = Self::raw_num_elements(dst, dst_end) else {
+            return false;
+        };
+        let count_info = match count {
+            Some((buf, off)) => {
+                let Some(end) = off.checked_add(4).filter(|&e| e <= u64::from(u32::MAX)) else {
+                    return false;
+                };
+                let Some(elems) = Self::raw_num_elements(buf, end) else {
+                    return false;
+                };
+                Some((buf, off as u32, elems))
+            }
+            None => None,
+        };
+
+        let src_idx = self.register_srv(src, src_elems);
+        let (count_idx, count_offset, has_count) = match count_info {
+            Some((buf, off, elems)) => (self.register_srv(buf, elems), off, 1u32),
+            None => (src_idx, 0u32, 0u32),
+        };
+        let dst_idx = self.register_uav(dst, dst_elems);
+        let flags = has_count | how;
+
+        for rec_idx in 0..records {
+            let seq = self.pending.len() as u32;
+            let rec_off = rec_idx * stride;
+            self.pending.push(PendingItem {
+                kind,
+                stride,
+                rec_idx,
+                flags,
+                src_offset: src_offset as u32 + rec_off,
+                count_offset,
+                dst_offset: dst_offset as u32 + rec_off,
+                src_idx,
+                count_idx,
+                dst_idx,
+                seq,
+            });
+        }
+        true
+    }
+
+    fn ensure_heap(&mut self, device: &ID3D12Device, needed: u32) -> Option<(ID3D12DescriptorHeap, u32)> {
+        let cap = self.heap.as_ref().map_or(0, |(_, c)| *c);
+        if self.heap.is_none() || self.heap_used.saturating_add(needed) > cap {
+            let new_cap = GATHER_HEAP_SLOTS.max(needed);
+            // SAFETY: valid shader-visible CBV/SRV/UAV descriptor heap creation.
+            let new_heap: ID3D12DescriptorHeap = unsafe {
+                device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: new_cap,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    })
+                    .ok()?
+            };
+            if let Some((old, _)) = self.heap.replace((new_heap, new_cap)) {
+                self.retired_heaps.push(old);
+            }
+            self.heap_used = 0;
+        }
+        let base = self.heap_used;
+        self.heap_used += needed;
+        Some((self.heap.as_ref()?.0.clone(), base))
+    }
+
+    fn ensure_costs(&mut self, device: &ID3D12Device, items: u32) -> Option<ID3D12Resource> {
+        let needed_bytes = u64::from(items).max(1) * 4;
+        if let Some((buf, cap)) = &self.costs
+            && *cap >= items
+        {
+            return Some(buf.clone());
+        }
+        let alloc_items = items.max(2048).next_power_of_two();
+        let size = (u64::from(alloc_items) * 4).max(needed_bytes).next_multiple_of(256);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut out: Option<ID3D12Resource> = None;
+        // SAFETY: plain device-local UAV buffer creation.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut out,
+                )
+                .ok()?;
+        }
+        let buf = out?;
+        if let Some((old, _)) = self.costs.replace((buf.clone(), alloc_items)) {
+            self.kept_resources.push(old);
+        }
+        self.costs_used = false;
+        Some(buf)
+    }
+
+    /// Flushes all pending gathered clamps onto `cmd_list`, allocating metadata
+    /// upload memory via `alloc_scratch` (must remain alive until GPU completion).
+    #[allow(clippy::too_many_arguments)]
+    fn flush_on(
+        &mut self,
+        device: &ID3D12Device,
+        g: &GatherClamp,
+        cmd_list: &ID3D12GraphicsCommandList,
+        budget_gpu: u64,
+        budget_res: &ID3D12Resource,
+        mode7_barrier_after: bool,
+        alloc_scratch: impl FnOnce(u64) -> Option<(u64, *mut u8)>,
+    ) -> Option<GatherFlushStats> {
+        if self.pending.is_empty() {
+            return Some(GatherFlushStats::default());
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let srvs = std::mem::take(&mut self.srvs);
+        self.srv_index.clear();
+        let uavs = std::mem::take(&mut self.uavs);
+        self.uav_index.clear();
+
+        let total_items = pending.len() as u32;
+        let num_srvs = srvs.len() as u32;
+        let num_uavs = uavs.len() as u32;
+
+        // First check whether contiguous runs in original `seq` order fit within
+        // `GATHER_SINGLE_PASS_MAX_GROUPS` uniform groups of up to 64 items.
+        let mut seq_groups: Vec<(u32, u32, u16, u16, u16)> = Vec::new();
+        for (i, item) in pending.iter().enumerate() {
+            let key = (item.src_idx, item.count_idx, item.dst_idx);
+            match seq_groups.last_mut() {
+                Some(last) if (last.2, last.3, last.4) == key && last.1 < 64 => {
+                    last.1 += 1;
+                }
+                _ => {
+                    seq_groups.push((i as u32, 1, key.0, key.1, key.2));
+                }
+            }
+        }
+
+        let single_pass = seq_groups.len() <= GATHER_SINGLE_PASS_MAX_GROUPS;
+        let (ordered_items, groups_raw): (Vec<[u32; 8]>, Vec<[u32; 4]>) = if single_pass {
+            let items_raw = pending
+                .iter()
+                .map(|it| {
+                    [
+                        it.kind,
+                        it.stride,
+                        it.rec_idx,
+                        it.flags,
+                        it.src_offset,
+                        it.count_offset,
+                        it.dst_offset,
+                        (it.seq & 0x00FF_FFFF) | (u32::from(it.dst_idx) << 24),
+                    ]
+                })
+                .collect();
+            let groups_raw = seq_groups
+                .iter()
+                .map(|&(first, count, s, c, d)| {
+                    [first, count, u32::from(s), u32::from(c) | (u32::from(d) << 16)]
+                })
+                .collect();
+            (items_raw, groups_raw)
+        } else {
+            // Bucket items by `(src_idx, count_idx, dst_idx)` so each 64-lane
+            // threadgroup packs as many items sharing the same uniform resources
+            // as possible. Original `seq` is preserved in `w1.w` for Pass 2.
+            let mut order: Vec<usize> = (0..pending.len()).collect();
+            order.sort_by_key(|&i| {
+                let it = &pending[i];
+                (it.src_idx, it.count_idx, it.dst_idx, it.seq)
+            });
+            let mut items_raw = Vec::with_capacity(pending.len());
+            let mut groups_raw: Vec<[u32; 4]> = Vec::new();
+            let mut last_key: Option<(u16, u16, u16)> = None;
+            for &idx in &order {
+                let it = &pending[idx];
+                let key = (it.src_idx, it.count_idx, it.dst_idx);
+                let out_pos = items_raw.len() as u32;
+                items_raw.push([
+                    it.kind,
+                    it.stride,
+                    it.rec_idx,
+                    it.flags,
+                    it.src_offset,
+                    it.count_offset,
+                    it.dst_offset,
+                    (it.seq & 0x00FF_FFFF) | (u32::from(it.dst_idx) << 24),
+                ]);
+                match groups_raw.last_mut() {
+                    Some(last) if last_key == Some(key) && last[1] < 64 => {
+                        last[1] += 1;
+                    }
+                    _ => {
+                        groups_raw.push([
+                            out_pos,
+                            1,
+                            u32::from(key.0),
+                            u32::from(key.1) | (u32::from(key.2) << 16),
+                        ]);
+                        last_key = Some(key);
+                    }
+                }
+            }
+            (items_raw, groups_raw)
+        };
+
+        let num_groups = groups_raw.len() as u32;
+        let items_bytes = (ordered_items.len() * 32) as u64;
+        let groups_offset = items_bytes.next_multiple_of(16);
+        let groups_bytes = (groups_raw.len() * 16) as u64;
+        let total_scratch = groups_offset + groups_bytes;
+        let (scratch_gpu, scratch_cpu) = alloc_scratch(total_scratch)?;
+
+        // SAFETY: `scratch_cpu` points to `total_scratch` writable mapped bytes
+        // in upload memory that outlive the command list's GPU execution.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ordered_items.as_ptr().cast::<u8>(),
+                scratch_cpu,
+                items_bytes as usize,
+            );
+            std::ptr::copy_nonoverlapping(
+                groups_raw.as_ptr().cast::<u8>(),
+                scratch_cpu.add(groups_offset as usize),
+                groups_bytes as usize,
+            );
+        }
+
+        let (heap, base) = self.ensure_heap(device, num_srvs + num_uavs)?;
+        // SAFETY: live device, shader-visible descriptor heap, valid buffer resources.
+        let (srv_gpu_handle, uav_gpu_handle) = unsafe {
+            let inc = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let cpu_start = heap.GetCPUDescriptorHandleForHeapStart();
+            let gpu_start = heap.GetGPUDescriptorHandleForHeapStart();
+            for (i, (res, num_elems)) in srvs.iter().enumerate() {
+                let mut h = cpu_start;
+                h.ptr += (base as usize + i) * inc;
+                let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            FirstElement: 0,
+                            NumElements: *num_elems,
+                            StructureByteStride: 0,
+                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        },
+                    },
+                };
+                device.CreateShaderResourceView(res, Some(&desc), h);
+            }
+            for (i, (res, num_elems)) in uavs.iter().enumerate() {
+                let mut h = cpu_start;
+                h.ptr += (base as usize + num_srvs as usize + i) * inc;
+                let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: 0,
+                            NumElements: *num_elems,
+                            StructureByteStride: 0,
+                            CounterOffsetInBytes: 0,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        },
+                    },
+                };
+                device.CreateUnorderedAccessView(res, None, Some(&desc), h);
+            }
+            let srv_gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: gpu_start.ptr + (base as u64) * (inc as u64),
+            };
+            let uav_gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: gpu_start.ptr + (base as u64 + u64::from(num_srvs)) * (inc as u64),
+            };
+            (srv_gpu, uav_gpu)
+        };
+
+        // Keep all SRV and UAV resources alive until `HostList::reset`.
+        self.kept_resources.extend(srvs.into_iter().map(|(r, _)| r));
+        self.kept_resources.extend(uavs.into_iter().map(|(r, _)| r));
+
+        let constants = [num_groups, total_items];
+        let mut dispatches = 0u32;
+        let mut barriers = 0u32;
+
+        if single_pass {
+            // SAFETY: open command list, live root signature/PSO/heap/buffers.
+            unsafe {
+                cmd_list.SetDescriptorHeaps(&[Some(heap)]);
+                cmd_list.SetComputeRootSignature(&g.single_root);
+                cmd_list.SetPipelineState(&g.single_pso);
+                cmd_list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                cmd_list.SetComputeRootShaderResourceView(1, scratch_gpu);
+                cmd_list.SetComputeRootShaderResourceView(2, scratch_gpu + groups_offset);
+                cmd_list.SetComputeRootUnorderedAccessView(3, budget_gpu);
+                cmd_list.SetComputeRootDescriptorTable(4, srv_gpu_handle);
+                cmd_list.SetComputeRootDescriptorTable(5, uav_gpu_handle);
+                cmd_list.Dispatch(1, 1, 1);
+                dispatches += 1;
+                if mode7_barrier_after {
+                    cmd_list.ResourceBarrier(&[uav_barrier_on(budget_res)]);
+                    barriers += 1;
+                }
+            }
+        } else {
+            let costs_res = self.ensure_costs(device, total_items)?;
+            // SAFETY: live device-local UAV buffer.
+            let costs_gpu = unsafe { costs_res.GetGPUVirtualAddress() };
+            // SAFETY: open command list, live root signature/PSOs/heap/buffers.
+            unsafe {
+                if self.costs_used {
+                    cmd_list.ResourceBarrier(&[uav_barrier_on(&costs_res)]);
+                    barriers += 1;
+                }
+                cmd_list.SetDescriptorHeaps(&[Some(heap)]);
+                cmd_list.SetComputeRootSignature(&g.twopass_root);
+                cmd_list.SetPipelineState(&g.pass1_pso);
+                cmd_list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                cmd_list.SetComputeRootShaderResourceView(1, scratch_gpu);
+                cmd_list.SetComputeRootShaderResourceView(2, scratch_gpu + groups_offset);
+                cmd_list.SetComputeRootUnorderedAccessView(3, budget_gpu);
+                cmd_list.SetComputeRootUnorderedAccessView(4, costs_gpu);
+                cmd_list.SetComputeRootDescriptorTable(5, srv_gpu_handle);
+                cmd_list.SetComputeRootDescriptorTable(6, uav_gpu_handle);
+                cmd_list.Dispatch(num_groups, 1, 1);
+                dispatches += 1;
+                cmd_list.ResourceBarrier(&[uav_barrier_on(&costs_res)]);
+                barriers += 1;
+                cmd_list.SetPipelineState(&g.pass2_pso);
+                cmd_list.Dispatch(1, 1, 1);
+                dispatches += 1;
+                if mode7_barrier_after {
+                    cmd_list.ResourceBarrier(&[uav_barrier_on(budget_res)]);
+                    barriers += 1;
+                }
+            }
+            self.costs_used = true;
+        }
+
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+
+        Some(GatherFlushStats {
+            items: total_items,
+            groups: num_groups,
+            dispatches,
+            barriers,
+            two_pass: !single_pass,
+        })
+    }
+}
+
+/// Flushes any pending gathered indirect clamps recorded into `clamps`.
+/// Called by `HostList::clamp_end` before transitioning destination chunks to
+/// `INDIRECT_ARGUMENT`, and by `bound_before` before a non-gatherable clamp or
+/// batch capacity flush.
+pub(crate) fn flush_gather(clamps: &HostList, mode7_barrier_after: bool) {
+    let mut state = clamps.gather_state().lock().unwrap_or_else(|e| e.into_inner());
+    if state.is_empty() {
+        return;
+    }
+    let Some(h) = host() else {
+        state.pending.clear();
+        return;
+    };
+    let Some(g) = gather_clamp() else {
+        state.pending.clear();
+        return;
+    };
+    let Some((budget_gpu, budget_res)) = clamps.budget_with_resource() else {
+        state.pending.clear();
+        return;
+    };
+    let _ = state.flush_on(
+        &h.device,
+        g,
+        &clamps.list,
+        budget_gpu,
+        budget_res,
+        mode7_barrier_after,
+        |len| clamps.scratch(len),
+    );
+}
+
 /// How clamps of indirect draws are recorded: 0 each before its draw; 1 in
 /// a list of their own before the list that draws, so that a run of draws
 /// is not interleaved with our dispatches; 2 as 1, with a barrier for
@@ -631,7 +1740,49 @@ pub(crate) fn bound_before(
     if records == 0 {
         return None;
     }
-    let (c, (budget, budget_res)) = (clamp()?, clamps.budget_with_resource()?);
+    let (budget, budget_res) = clamps.budget_with_resource()?;
+    let (dst, at) = clamps.clamp_room(bytes)?;
+
+    if gather_enabled() && records <= GATHER_MAX_RECORDS && gather_clamp().is_some() {
+        let mut state = clamps.gather_state().lock().unwrap_or_else(|e| e.into_inner());
+        if state.would_overflow(records, src, count.map(|(b, _)| b), &dst)
+            && let (Some(h), Some(g)) = (host(), gather_clamp())
+        {
+            let _ = state.flush_on(
+                &h.device,
+                g,
+                &clamps.list,
+                budget,
+                budget_res,
+                hoist_mode() == 7,
+                |len| clamps.scratch(len),
+            );
+        }
+        if state.enqueue((src, src_offset), count, (&dst, at), (kind, stride, records), 0) {
+            return Some((dst, at));
+        }
+        // Fallback to scalar path below: flush any queued gathered items first
+        // so budget charging stays strictly ordered before this scalar dispatch.
+        if !state.is_empty()
+            && let (Some(h), Some(g)) = (host(), gather_clamp())
+        {
+            let _ = state.flush_on(
+                &h.device,
+                g,
+                &clamps.list,
+                budget,
+                budget_res,
+                hoist_mode() == 7,
+                |len| clamps.scratch(len),
+            );
+        }
+    } else {
+        // Flush any queued gathered clamps before recording a scalar clamp so
+        // Mode 7 budget order is strictly preserved across mixed batches.
+        flush_gather(clamps, hoist_mode() == 7);
+    }
+
+    let c = clamp()?;
     // SAFETY: live buffers.
     let (src_base, count_base) = unsafe {
         (
@@ -657,7 +1808,6 @@ pub(crate) fn bound_before(
     if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return None;
     }
-    let (dst, at) = clamps.clamp_room(bytes)?;
     // SAFETY: a live buffer.
     let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
@@ -750,6 +1900,7 @@ void main() {
 "#;
 
     struct WarpHarness {
+        _warp_guard: std::sync::MutexGuard<'static, ()>,
         device: ID3D12Device,
         queue: ID3D12CommandQueue,
         allocator: ID3D12CommandAllocator,
@@ -763,18 +1914,35 @@ void main() {
 
     impl WarpHarness {
         fn new() -> Option<Self> {
-            // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
+            // Serialize WARP tests: concurrent queues/PSOs on `d3d10warp.dll`
+            // hit an intermittent null-deref (`0xc0000005`) in the software
+            // rasterizer under heavy multi-thread contention.
+            static WARP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _warp_guard = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            static WARP_DEVICE: std::sync::OnceLock<Option<ID3D12Device>> =
+                std::sync::OnceLock::new();
+            // Keep one WARP device alive for the test binary so concurrent
+            // tests cannot race `d3d10warp.dll` teardown (`Release` -> 0) with
+            // another thread's `D3D12CreateDevice(&warp_adapter)`.
+            let device = WARP_DEVICE
+                .get_or_init(|| {
+                    // SAFETY: plain DXGI WARP query and D3D12 device creation.
+                    unsafe {
+                        let factory: IDXGIFactory4 =
+                            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+                        let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+                        let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
+                        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                            return None;
+                        }
+                        let mut device: Option<ID3D12Device> = None;
+                        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                        device
+                    }
+                })
+                .clone()?;
+            // SAFETY: plain D3D12 test harness setup on the live WARP device.
             unsafe {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
-                let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
-                    return None;
-                }
-                let mut device: Option<ID3D12Device> = None;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
-                let device = device?;
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                         Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -792,6 +1960,7 @@ void main() {
                 let clamp = make_for(&device).expect("clamp shader must compile on WARP");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
+                    _warp_guard,
                     device,
                     queue,
                     allocator,
@@ -925,23 +2094,9 @@ void main() {
     }
 
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: source and entry names outlive `D3DCompile`.
+        let code = compile_blob(source, s!("worker"), 0)?;
+        // SAFETY: compiled DXBC blob with embedded root signature.
         unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("worker"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.unwrap();
             let bytes = std::slice::from_raw_parts(
                 code.GetBufferPointer().cast::<u8>(),
                 code.GetBufferSize(),
@@ -2303,5 +3458,1303 @@ void work() {
             least.push(runs[0].0);
         }
         assert!(least.iter().all(|us| us.is_finite() && *us > 0.0), "the card gave no time for a batch");
+    }
+}
+
+#[cfg(test)]
+mod gather_hw_tests {
+    use super::*;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::*;
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::core::Interface;
+
+    const WORKER_CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer hits : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint prev;
+    hits.InterlockedAdd(0, 1, prev);
+}
+"#;
+
+    fn buffer(
+        device: &ID3D12Device,
+        size: u64,
+        kind: D3D12_HEAP_TYPE,
+        flags: D3D12_RESOURCE_FLAGS,
+        state: D3D12_RESOURCE_STATES,
+    ) -> ID3D12Resource {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: kind,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut out: Option<ID3D12Resource> = None;
+        // SAFETY: plain buffer creation.
+        unsafe {
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut out)
+                .unwrap();
+        }
+        out.unwrap()
+    }
+
+    fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+        let code = compile_blob(source, s!("worker"), 0)?;
+        // SAFETY: compiled DXBC blob with embedded root signature.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })?;
+            Ok(Clamp { root, pso })
+        }
+    }
+
+    fn hw_worker(device: &ID3D12Device) -> &'static Clamp {
+        static WORKER: std::sync::OnceLock<Clamp> = std::sync::OnceLock::new();
+        WORKER.get_or_init(|| {
+            compile_cs(device, WORKER_CS).expect("worker shader must compile on HW GPU")
+        })
+    }
+
+    /// Hardware D3D12 harness for bit-exact gather-clamp parity tests and
+    /// real-GPU benchmarks. Enables the D3D12 debug layer when
+    /// `VICTORY_D3D12_DEBUG` is set and asserts zero debug-layer errors after
+    /// every submission.
+    struct HwGatherHarness {
+        device: ID3D12Device,
+        queue: ID3D12CommandQueue,
+        allocator: ID3D12CommandAllocator,
+        list: ID3D12GraphicsCommandList,
+        fence: ID3D12Fence,
+        submitted: u64,
+        event: HANDLE,
+        clamp: &'static Clamp,
+        gather: &'static GatherClamp,
+        worker: &'static Clamp,
+        stamps: ID3D12QueryHeap,
+        stamp_readback: ID3D12Resource,
+        info: Option<ID3D12InfoQueue>,
+        card: String,
+    }
+
+    impl HwGatherHarness {
+        fn new() -> Option<Self> {
+            let require_hw = std::env::var_os("VICTORY_REQUIRE_HW_GPU")
+                .is_some_and(|v| v != "0");
+            let debug_on = cfg!(feature = "diagnostics")
+                && std::env::var_os("VICTORY_D3D12_DEBUG").is_some_and(|v| v != "0");
+            // Reuse `crate::host::host()`'s singleton device so `EnableDebugLayer()`
+            // is called strictly once before `D3D12CreateDevice` (calling
+            // `EnableDebugLayer` on another thread after an existing non-debug
+            // device is created removes the live device with DXGI_ERROR_DEVICE_RESET).
+            let Some(h) = crate::host::host() else {
+                assert!(
+                    !require_hw,
+                    "VICTORY_REQUIRE_HW_GPU=1 set, but host D3D12 device is unavailable"
+                );
+                return None;
+            };
+            let device = h.device.clone();
+            // SAFETY: plain DXGI / D3D12 queries and test-rig creation on the live device.
+            unsafe {
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+                let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(device.GetAdapterLuid()).ok()?;
+                let desc = adapter.GetDesc1().ok()?;
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    assert!(
+                        !require_hw,
+                        "VICTORY_REQUIRE_HW_GPU=1 set, but host adapter is software"
+                    );
+                    return None;
+                }
+                let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+                let card = String::from_utf16_lossy(&desc.Description[..end]);
+                let info = debug_on
+                    .then(|| device.cast::<ID3D12InfoQueue>().ok())
+                    .flatten();
+                if let Some(iq) = &info {
+                    iq.ClearStoredMessages();
+                }
+                let queue: ID3D12CommandQueue = device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    })
+                    .ok()?;
+                let allocator: ID3D12CommandAllocator = device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .ok()?;
+                let list: ID3D12GraphicsCommandList = device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                    .ok()?;
+                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                let event = CreateEventW(None, false, false, None).ok()?;
+                let clamp = clamp().expect("scalar clamp shader must compile on HW GPU");
+                let gather = gather_clamp().expect("gather clamp shaders must compile on HW GPU");
+                let worker = hw_worker(&device);
+                let mut stamps: Option<ID3D12QueryHeap> = None;
+                device
+                    .CreateQueryHeap(
+                        &D3D12_QUERY_HEAP_DESC {
+                            Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                            Count: 2,
+                            NodeMask: 0,
+                        },
+                        &mut stamps,
+                    )
+                    .ok()?;
+                let stamps = stamps?;
+                let stamp_readback = buffer(
+                    &device,
+                    256,
+                    D3D12_HEAP_TYPE_READBACK,
+                    D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
+                Some(Self {
+                    device,
+                    queue,
+                    allocator,
+                    list,
+                    fence,
+                    submitted: 0,
+                    event,
+                    clamp,
+                    gather,
+                    worker,
+                    stamps,
+                    stamp_readback,
+                    info,
+                    card,
+                })
+            }
+        }
+
+        fn shared_buffer(&self, size: u64) -> (ID3D12Resource, *mut u8, u64) {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size.max(4),
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut out: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: valid buffer creation and persistent CPU map.
+            unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut out,
+                    )
+                    .unwrap();
+                let res = out.unwrap();
+                res.Map(0, None, Some(&mut data)).unwrap();
+                let gpu = res.GetGPUVirtualAddress();
+                (res, data.cast(), gpu)
+            }
+        }
+
+        fn upload_buffer(&self, size: u64) -> (ID3D12Resource, *mut u8, u64) {
+            let res = buffer(
+                &self.device,
+                size.max(256).next_multiple_of(256),
+                D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            );
+            let mut data = std::ptr::null_mut();
+            // SAFETY: persistent map of upload buffer.
+            unsafe {
+                res.Map(0, None, Some(&mut data)).unwrap();
+                let gpu = res.GetGPUVirtualAddress();
+                (res, data.cast(), gpu)
+            }
+        }
+
+        fn default_uav(&self, size: u64) -> ID3D12Resource {
+            buffer(
+                &self.device,
+                size.max(256),
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+            )
+        }
+
+        fn signature(&self, kind: u32, stride: u32) -> ID3D12CommandSignature {
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+                ..Default::default()
+            };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: stride,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &arg,
+                NodeMask: 0,
+            };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            // SAFETY: valid single-argument command signature.
+            unsafe {
+                self.device
+                    .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig)
+                    .unwrap();
+            }
+            sig.unwrap()
+        }
+
+        fn assert_debug_clean(&self) {
+            let Some(info) = &self.info else {
+                return;
+            };
+            // SAFETY: querying D3D12 InfoQueue messages owned by our test device.
+            unsafe {
+                let n = info.GetNumStoredMessages();
+                let mut errors = Vec::new();
+                for i in 0..n {
+                    let mut len = 0usize;
+                    let _ = info.GetMessage(i, None, &mut len);
+                    if len == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u8; len];
+                    let msg = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if info.GetMessage(i, Some(msg), &mut len).is_ok() {
+                        let sev = (*msg).Severity;
+                        // `D3D12CreateDevice` returns a process-wide singleton per
+                        // adapter, so `pipeline::library::tests` running in parallel
+                        // can intentionally log an invalid-blob error on the shared
+                        // InfoQueue. Ignore only that unrelated ID.
+                        if (*msg).ID == D3D12_MESSAGE_ID_CREATEPIPELINELIBRARY_INVALIDLIBRARYBLOB {
+                            continue;
+                        }
+                        if sev == D3D12_MESSAGE_SEVERITY_CORRUPTION
+                            || sev == D3D12_MESSAGE_SEVERITY_ERROR
+                        {
+                            let text = std::slice::from_raw_parts(
+                                (*msg).pDescription.cast::<u8>(),
+                                (*msg).DescriptionByteLength.saturating_sub(1),
+                            );
+                            errors.push(String::from_utf8_lossy(text).into_owned());
+                        }
+                    }
+                }
+                info.ClearStoredMessages();
+                assert!(
+                    errors.is_empty(),
+                    "D3D12 debug layer reported {} error(s):\n{}",
+                    errors.len(),
+                    errors.join("\n")
+                );
+            }
+        }
+
+        fn submit_and_wait(&mut self) {
+            self.submitted += 1;
+            // SAFETY: closing, submitting, fencing, waiting, and resetting our list.
+            unsafe {
+                self.list.Close().unwrap();
+                let cmd: ID3D12CommandList = self.list.cast().unwrap();
+                self.queue.ExecuteCommandLists(&[Some(cmd)]);
+                self.queue.Signal(&self.fence, self.submitted).unwrap();
+                self.fence
+                    .SetEventOnCompletion(self.submitted, self.event)
+                    .unwrap();
+                WaitForSingleObject(self.event, INFINITE);
+                assert!(
+                    self.device.GetDeviceRemovedReason().is_ok(),
+                    "GPU device removed during test"
+                );
+                self.allocator.Reset().unwrap();
+                self.list.Reset(&self.allocator, None).unwrap();
+            }
+            self.assert_debug_clean();
+        }
+
+        fn read_timestamp_ms(&self) -> f64 {
+            let mut data = std::ptr::null_mut();
+            let range = D3D12_RANGE { Begin: 0, End: 16 };
+            // SAFETY: reading resolved GPU timestamps after fence completion.
+            unsafe {
+                self.stamp_readback.Map(0, Some(&range), Some(&mut data)).unwrap();
+                let ticks = std::slice::from_raw_parts(data.cast::<u64>(), 2).to_vec();
+                self.stamp_readback.Unmap(0, None);
+                let freq = self.queue.GetTimestampFrequency().unwrap_or(1).max(1);
+                ticks[1].saturating_sub(ticks[0]) as f64 * 1e3 / freq as f64
+            }
+        }
+
+        fn read_default_words(&mut self, src: &ID3D12Resource, bytes: u64) -> Vec<u32> {
+            let rb = buffer(
+                &self.device,
+                bytes.max(4),
+                D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            // SAFETY: copying completed DEFAULT buffer to READBACK.
+            unsafe {
+                self.list.CopyBufferRegion(&rb, 0, src, 0, bytes);
+            }
+            self.submit_and_wait();
+            let mut data = std::ptr::null_mut();
+            let range = D3D12_RANGE {
+                Begin: 0,
+                End: bytes as usize,
+            };
+            // SAFETY: reading mapped READBACK buffer.
+            unsafe {
+                rb.Map(0, Some(&range), Some(&mut data)).unwrap();
+                let out = std::slice::from_raw_parts(data.cast::<u32>(), (bytes / 4) as usize).to_vec();
+                rb.Unmap(0, None);
+                out
+            }
+        }
+    }
+
+    /// Record a scalar reference clamp into `dst` at `dst_offset` (already in
+    /// `UNORDERED_ACCESS`) followed by a Mode 7 budget UAV barrier.
+    #[allow(clippy::too_many_arguments)]
+    fn record_scalar_into_uav(
+        c: &Clamp,
+        l: &ID3D12GraphicsCommandList,
+        dst: &ID3D12Resource,
+        dst_offset: u64,
+        budget_gpu: u64,
+        budget_res: &ID3D12Resource,
+        (src, src_offset): (&ID3D12Resource, u64),
+        count: Option<(&ID3D12Resource, u64)>,
+        (kind, stride, records): (u32, u32, u32),
+        how: u32,
+        mode7_barrier: bool,
+    ) {
+        // SAFETY: live D3D12 buffers and open command list.
+        unsafe {
+            let src_gpu = src.GetGPUVirtualAddress();
+            let (count_gpu, has_count, count_offset) = match count {
+                Some((buf, off)) => (buf.GetGPUVirtualAddress(), 1u32, off as u32),
+                None => (src_gpu, 0u32, 0u32),
+            };
+            let dst_gpu = dst.GetGPUVirtualAddress() + dst_offset;
+            let constants = [
+                kind,
+                stride,
+                records,
+                src_offset as u32,
+                has_count | how,
+                count_offset,
+            ];
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, src_gpu);
+            l.SetComputeRootShaderResourceView(2, count_gpu);
+            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+            l.SetComputeRootUnorderedAccessView(4, budget_gpu);
+            l.Dispatch(records.div_ceil(64), 1, 1);
+            if mode7_barrier {
+                l.ResourceBarrier(&[uav_barrier_on(budget_res)]);
+            }
+        }
+    }
+
+    /// Proves bit-exact parity of gathered clamps vs scalar reference clamps on
+    /// real hardware GPU (with `VICTORY_D3D12_DEBUG=1`) across all four kinds
+    /// (`DRAW`, `INDEXED`, `DISPATCH`, `MESH`), overflow/garbage inputs, `AHEAD`,
+    /// `SPLIT`, count buffers, trailing words, and BOTH single-pass and two-pass
+    /// gather paths.
+    #[test]
+    fn hw_gather_bit_exact_parity_all_kinds_and_flags() {
+        let Some(mut hw) = HwGatherHarness::new() else {
+            return;
+        };
+        struct Case {
+            buf_idx: usize,
+            src_offset: u64,
+            count_idx: Option<(usize, u64)>,
+            kind: u32,
+            stride: u32,
+            records: u32,
+            how: u32,
+            dst_offset: u64,
+            dst_bytes: u64,
+        }
+
+        for two_pass_mode in [false, true] {
+            let num_bufs = if two_pass_mode { 20 } else { 1 };
+            let mut src_bufs = Vec::new();
+            for _ in 0..num_bufs {
+                src_bufs.push(hw.shared_buffer(4096));
+            }
+            let (cnt_buf, cnt_ptr, _) = hw.shared_buffer(256);
+            // SAFETY: persistent mapping of 256 bytes.
+            unsafe {
+                let c = cnt_ptr.cast::<u32>();
+                c.add(0).write_volatile(3); // partial count (< max 6)
+                c.add(1).write_volatile(0); // zero count
+                c.add(2).write_volatile(100); // count > max
+            }
+
+            let mut cases = Vec::new();
+            let mut dst_cursor = 0u64;
+            let mut push_case = |buf_idx: usize,
+                                 src_offset: u64,
+                                 words: &[u32],
+                                 count_idx: Option<(usize, u64)>,
+                                 kind: u32,
+                                 stride: u32,
+                                 records: u32,
+                                 how: u32| {
+                // SAFETY: writing into mapped source buffer within 4096 bytes.
+                unsafe {
+                    let dst_p = src_bufs[buf_idx].1.add(src_offset as usize).cast::<u32>();
+                    for (k, &w) in words.iter().enumerate() {
+                        dst_p.add(k).write_volatile(w);
+                    }
+                }
+                let bytes = if (how & IN_PARTS) != 0 {
+                    u64::from(SPLIT) * PART_BYTES
+                } else {
+                    u64::from(stride) * u64::from(records)
+                };
+                let at = dst_cursor;
+                dst_cursor = (dst_cursor + bytes).next_multiple_of(16);
+                cases.push(Case {
+                    buf_idx,
+                    src_offset,
+                    count_idx,
+                    kind,
+                    stride,
+                    records,
+                    how,
+                    dst_offset: at,
+                    dst_bytes: bytes,
+                });
+            };
+
+            // 1. DRAW normal + trailing words (stride 24).
+            push_case(0, 0, &[360, 4, 17, 99, 0x1234_5678, 0xdead_beef], None, 0, 24, 1, 0);
+            // 2. DRAW overflow vertex + instance counts.
+            push_case(1 % num_bufs, 64, &[0xFFFF_FFFF, 0xFFFF_FFFF, 5, 11], None, 0, 16, 1, 0);
+            // 3. DRAW with AHEAD flag and garbage (> 1<<24) -> zeroed, 0 budget.
+            push_case(2 % num_bufs, 128, &[0xFFFF_FFFF, 2, 7, 8], None, 0, 16, 1, AHEAD);
+            // 4. DRAW with zero vertices and non-zero instances (cost == 0, keep instances).
+            push_case(3 % num_bufs, 192, &[0, 7, 1, 2], None, 0, 16, 1, 0);
+            // 5. INDEXED normal + trailing words (stride 28).
+            push_case(4 % num_bufs, 256, &[1200, 3, 10, 0xFFFF_FFFC, 42, 0xaaaa_bbbb, 0x5555_6666], None, 1, 28, 1, 0);
+            // 6. INDEXED with count buffer: max=6, count=3 (tail 3 slots hold garbage that must be untouched).
+            let mut counted_words = Vec::new();
+            for r in 0..6u32 {
+                if r < 3 {
+                    counted_words.extend_from_slice(&[100 + r * 10, 2, r, 1000 + r, 50 + r]);
+                } else {
+                    counted_words.extend_from_slice(&[0xFFFF_FFFF, 0xFFFF_FFFF, 0xBAD0_0000 + r, 0, 0]);
+                }
+            }
+            push_case(5 % num_bufs, 320, &counted_words, Some((0, 0)), 1, 20, 6, 0);
+            // 7. DRAW with count=0 -> completely skipped, sentinel untouched.
+            push_case(6 % num_bufs, 512, &[500, 500, 1, 2], Some((0, 4)), 0, 16, 2, 0);
+            // 8. DISPATCH normal + trailing padding (stride 20).
+            push_case(7 % num_bufs, 576, &[128, 4, 2, 0x1111_2222, 0x3333_4444], None, 2, 20, 1, 0);
+            // 9. DISPATCH product > GROUPS (1<<20) -> zeroed.
+            push_case(8 % num_bufs, 640, &[2048, 2048, 1], None, 2, 12, 1, 0);
+            // 10. DISPATCH SPLIT (115,200 groups -> 65535 + 49665).
+            push_case(9 % num_bufs, 704, &[115_200, 1, 1], None, 2, 12, 1, IN_PARTS);
+            // 11. DISPATCH SPLIT overflow (> 2 * 65535 -> clamped to 65535 + 0).
+            push_case(10 % num_bufs, 768, &[200_000, 1, 1], None, 2, 12, 1, IN_PARTS);
+            // 12. MESH normal + diagnostics update.
+            push_case(11 % num_bufs, 832, &[300, 4, 9, 0x7777_8888], None, 10, 16, 1, 0);
+            // 13. MESH AHEAD garbage (0xFFFF_FFFF > 65535) -> zeroed, not counted in diagnostics.
+            push_case(12 % num_bufs, 896, &[0xFFFF_FFFF, 1, 1], None, 10, 12, 1, AHEAD);
+            // 14. MESH non-ahead huge (> 65535) -> clamped to (65535, 1, 1) and diagnostics updated.
+            push_case(13 % num_bufs, 960, &[100_000, 2, 3], None, 10, 12, 1, 0);
+            // Extra scattered cases: in single-pass mode keep count binding
+            // contiguous so `seq_groups <= 8` exercises the 1-dispatch path;
+            // in two-pass mode spread across 20 buffers + alternating counts.
+            for extra in 0..12usize {
+                let b = (14 + extra) % num_bufs;
+                let cnt = if two_pass_mode {
+                    (extra % 3 == 0).then_some((0, 8))
+                } else {
+                    None
+                };
+                push_case(
+                    b,
+                    1024 + (extra as u64) * 32,
+                    &[25 + extra as u32, 1, 1],
+                    cnt,
+                    if extra % 2 == 0 { 10 } else { 2 },
+                    12,
+                    1,
+                    0,
+                );
+            }
+
+            let total_bytes = dst_cursor.next_multiple_of(256);
+            // Pre-fill both destinations with a sentinel pattern so untouched tail slots
+            // (count=0 / rec >= count) are verified to stay untouched too!
+            let (sentinel_src, sentinel_ptr, _) = hw.upload_buffer(total_bytes);
+            // SAFETY: persistent mapping of `total_bytes`.
+            unsafe {
+                let s = std::slice::from_raw_parts_mut(sentinel_ptr.cast::<u32>(), (total_bytes / 4) as usize);
+                s.fill(0xA5A5_5A5A);
+            }
+
+            let dst_scalar = hw.default_uav(total_bytes);
+            let dst_gather = hw.default_uav(total_bytes);
+            let (budget_scalar, budget_scalar_ptr, budget_scalar_gpu) = hw.shared_buffer(256);
+            let (budget_gather, budget_gather_ptr, budget_gather_gpu) = hw.shared_buffer(256);
+            // SAFETY: zeroing 12 bytes of each budget buffer.
+            unsafe {
+                for k in 0..3 {
+                    budget_scalar_ptr.cast::<u32>().add(k).write_volatile(0);
+                    budget_gather_ptr.cast::<u32>().add(k).write_volatile(0);
+                }
+                hw.list.CopyBufferRegion(&dst_scalar, 0, &sentinel_src, 0, total_bytes);
+                hw.list.CopyBufferRegion(&dst_gather, 0, &sentinel_src, 0, total_bytes);
+                hw.list.ResourceBarrier(&[
+                    transition(
+                        &dst_scalar,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    ),
+                    transition(
+                        &dst_gather,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    ),
+                ]);
+            }
+
+            // Record scalar reference.
+            for c in &cases {
+                let count_arg = c.count_idx.map(|(_, off)| (&cnt_buf, off));
+                record_scalar_into_uav(
+                    hw.clamp,
+                    &hw.list,
+                    &dst_scalar,
+                    c.dst_offset,
+                    budget_scalar_gpu,
+                    &budget_scalar,
+                    (&src_bufs[c.buf_idx].0, c.src_offset),
+                    count_arg,
+                    (c.kind, c.stride, c.records),
+                    c.how,
+                    true,
+                );
+            }
+
+            // Record gather-clamp batch.
+            let mut gather_state = GatherState::default();
+            for c in &cases {
+                let count_arg = c.count_idx.map(|(_, off)| (&cnt_buf, off));
+                assert!(gather_state.enqueue(
+                    (&src_bufs[c.buf_idx].0, c.src_offset),
+                    count_arg,
+                    (&dst_gather, c.dst_offset),
+                    (c.kind, c.stride, c.records),
+                    c.how,
+                ));
+            }
+            let (scratch_res, scratch_ptr, scratch_gpu) = hw.upload_buffer(64 << 10);
+            let stats = gather_state
+                .flush_on(
+                    &hw.device,
+                    hw.gather,
+                    &hw.list,
+                    budget_gather_gpu,
+                    &budget_gather,
+                    false,
+                    |len| {
+                        assert!(len <= (64 << 10));
+                        Some((scratch_gpu, scratch_ptr))
+                    },
+                )
+                .expect("gather flush must succeed");
+            assert_eq!(stats.two_pass, two_pass_mode);
+            // SAFETY: transition destinations back to COMMON before submit_and_wait.
+            unsafe {
+                hw.list.ResourceBarrier(&[
+                    transition(
+                        &dst_scalar,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    ),
+                    transition(
+                        &dst_gather,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    ),
+                ]);
+            }
+            hw.submit_and_wait();
+            drop(scratch_res);
+
+            let scalar_words = hw.read_default_words(&dst_scalar, total_bytes);
+            let gather_words = hw.read_default_words(&dst_gather, total_bytes);
+            assert_eq!(
+                gather_words, scalar_words,
+                "gather output diverged from scalar reference (two_pass={two_pass_mode})"
+            );
+            // SAFETY: reading budget words after fence completion.
+            let (bs, bg) = unsafe {
+                let r = |p: *mut u8| {
+                    let w = p.cast::<u32>();
+                    [w.add(0).read_volatile(), w.add(1).read_volatile(), w.add(2).read_volatile()]
+                };
+                (r(budget_scalar_ptr), r(budget_gather_ptr))
+            };
+            assert_eq!(
+                bg, bs,
+                "budget words diverged (two_pass={two_pass_mode}): gather={bg:?} scalar={bs:?}"
+            );
+            // Also verify count=3 left slots 3..5 as untouched sentinel 0xA5A5_5A5A.
+            let c6 = &cases[5];
+            let tail_start = ((c6.dst_offset + 3 * u64::from(c6.stride)) / 4) as usize;
+            let tail_end = ((c6.dst_offset + c6.dst_bytes) / 4) as usize;
+            assert!(
+                gather_words[tail_start..tail_end]
+                    .iter()
+                    .all(|&w| w == 0xA5A5_5A5A),
+                "inactive counted tail slots were unexpectedly overwritten"
+            );
+            gather_state.reset();
+        }
+    }
+
+    /// Proves bit-exact Mode 7 index-order budget saturation (`BUDGET = 1<<27`)
+    /// across 256 scattered records in BOTH single-pass (1 buffer) and two-pass
+    /// (32 interleaved buffers) modes, including exact boundary (`rem == cost`)
+    /// and non-zero initial budget.
+    #[test]
+    fn hw_gather_budget_saturation_exact_order() {
+        let Some(mut hw) = HwGatherHarness::new() else {
+            return;
+        };
+        const N: usize = 256;
+        const STRIDE: u32 = 20;
+        const SLOT_ALIGN: u64 = 32;
+        let total_bytes = (N as u64 * SLOT_ALIGN).next_multiple_of(256);
+
+        for (num_bufs, initial_budget, expect_two_pass) in [
+            (1usize, 0u32, false),
+            (1usize, (1u32 << 27) - 5_000_000, false),
+            (32usize, 0u32, true),
+            (32usize, (1u32 << 27) - 1_000_000, true),
+        ] {
+            let mut src_bufs = Vec::new();
+            for _ in 0..num_bufs {
+                src_bufs.push(hw.shared_buffer(16 << 10));
+            }
+            for i in 0..N {
+                let b = i % num_bufs;
+                let off = (i / num_bufs) * 32;
+                // Each record costs 1_000_000 vertices (10_000 * 100); 134 records fit
+                // cleanly into BUDGET=134_217_728, record 134 saturates! Also inject
+                // an exact-boundary record at i == 134 for initial_budget == 0.
+                let (verts, insts) = if initial_budget == 0 && i == 134 {
+                    (217_728u32, 1u32) // exact remaining budget!
+                } else if i % 17 == 0 {
+                    (0u32, 5u32) // zero-cost record: must stay (0, 5) even after saturation!
+                } else {
+                    (10_000u32, 100u32)
+                };
+                // SAFETY: writing 20 bytes inside mapped 16 KiB source buffer.
+                unsafe {
+                    let p = src_bufs[b].1.add(off).cast::<u32>();
+                    p.add(0).write_volatile(verts);
+                    p.add(1).write_volatile(insts);
+                    p.add(2).write_volatile(i as u32);
+                    p.add(3).write_volatile(0x1000 + i as u32);
+                    p.add(4).write_volatile(0x2000 + i as u32);
+                }
+            }
+
+            let dst_scalar = hw.default_uav(total_bytes);
+            let dst_gather = hw.default_uav(total_bytes);
+            let (budget_s, budget_s_ptr, budget_s_gpu) = hw.shared_buffer(256);
+            let (budget_g, budget_g_ptr, budget_g_gpu) = hw.shared_buffer(256);
+            // SAFETY: initializing budget words and transitioning destinations.
+            unsafe {
+                budget_s_ptr.cast::<u32>().write_volatile(initial_budget);
+                budget_g_ptr.cast::<u32>().write_volatile(initial_budget);
+                for k in 1..3 {
+                    budget_s_ptr.cast::<u32>().add(k).write_volatile(0);
+                    budget_g_ptr.cast::<u32>().add(k).write_volatile(0);
+                }
+                hw.list.ResourceBarrier(&[
+                    transition(
+                        &dst_scalar,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    ),
+                    transition(
+                        &dst_gather,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    ),
+                ]);
+            }
+
+            let mut gather_state = GatherState::default();
+            for i in 0..N {
+                let b = i % num_bufs;
+                let src_off = ((i / num_bufs) * 32) as u64;
+                let dst_off = (i as u64) * SLOT_ALIGN;
+                record_scalar_into_uav(
+                    hw.clamp,
+                    &hw.list,
+                    &dst_scalar,
+                    dst_off,
+                    budget_s_gpu,
+                    &budget_s,
+                    (&src_bufs[b].0, src_off),
+                    None,
+                    (1, STRIDE, 1),
+                    0,
+                    true,
+                );
+                assert!(gather_state.enqueue(
+                    (&src_bufs[b].0, src_off),
+                    None,
+                    (&dst_gather, dst_off),
+                    (1, STRIDE, 1),
+                    0,
+                ));
+            }
+            let (scratch_res, scratch_ptr, scratch_gpu) = hw.upload_buffer(64 << 10);
+            let stats = gather_state
+                .flush_on(
+                    &hw.device,
+                    hw.gather,
+                    &hw.list,
+                    budget_g_gpu,
+                    &budget_g,
+                    false,
+                    |len| (len <= (64 << 10)).then_some((scratch_gpu, scratch_ptr)),
+                )
+                .expect("gather flush must succeed");
+            assert_eq!(stats.two_pass, expect_two_pass);
+
+            // SAFETY: transitioning destinations back to COMMON.
+            unsafe {
+                hw.list.ResourceBarrier(&[
+                    transition(
+                        &dst_scalar,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    ),
+                    transition(
+                        &dst_gather,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    ),
+                ]);
+            }
+            hw.submit_and_wait();
+            drop(scratch_res);
+
+            let sw = hw.read_default_words(&dst_scalar, total_bytes);
+            let gw = hw.read_default_words(&dst_gather, total_bytes);
+            assert_eq!(
+                gw, sw,
+                "saturation output diverged (num_bufs={num_bufs}, init={initial_budget})"
+            );
+            // SAFETY: reading final budgets after GPU fence.
+            let (bs0, bg0) = unsafe {
+                (
+                    budget_s_ptr.cast::<u32>().read_volatile(),
+                    budget_g_ptr.cast::<u32>().read_volatile(),
+                )
+            };
+            assert_eq!(bg0, 1u32 << 27, "budget should have saturated at 1<<27");
+            assert_eq!(bg0, bs0);
+            gather_state.reset();
+        }
+    }
+
+    /// Tests mid-list hazard flush (gather batch 1 -> Mode 7 budget barrier ->
+    /// wide scalar clamp -> gather batch 2 -> transition to `INDIRECT_ARGUMENT`
+    /// -> real GPU `ExecuteIndirect` running `WORKER_CS` on clamped dispatches).
+    #[test]
+    fn hw_gather_mid_list_hazard_flush_and_execute_indirect() {
+        let Some(mut hw) = HwGatherHarness::new() else {
+            return;
+        };
+        let (src, src_ptr, _) = hw.shared_buffer(4096);
+        let (_hits, hits_ptr, hits_gpu) = hw.shared_buffer(64);
+        let (budget, budget_ptr, budget_gpu) = hw.shared_buffer(256);
+        let dst = hw.default_uav(4096);
+        // SAFETY: writing test dispatch arguments and zeroing hits/budget.
+        unsafe {
+            hits_ptr.cast::<u32>().write_volatile(0);
+            for k in 0..3 {
+                budget_ptr.cast::<u32>().add(k).write_volatile(0);
+            }
+            let w = src_ptr.cast::<u32>();
+            // Batch 1 (4 scattered single dispatches): 3 + 5 + 7 + 0 (overflow > GROUPS) = 15 groups.
+            for (i, g) in [
+                [3u32, 1, 1],
+                [5, 1, 1],
+                [7, 1, 1],
+                [2048, 2048, 1], // > GROUPS => clamped to (0,0,0)
+            ]
+            .iter()
+            .enumerate()
+            {
+                let base = i * 4;
+                w.add(base).write_volatile(g[0]);
+                w.add(base + 1).write_volatile(g[1]);
+                w.add(base + 2).write_volatile(g[2]);
+            }
+            // Mid-list scalar clamp at offset 64: 1 dispatch of 11 groups.
+            w.add(16).write_volatile(11);
+            w.add(17).write_volatile(1);
+            w.add(18).write_volatile(1);
+            // Batch 2 (2 scattered dispatches at offsets 128, 144): 4 + 6 = 10 groups.
+            w.add(32).write_volatile(4);
+            w.add(33).write_volatile(1);
+            w.add(34).write_volatile(1);
+            w.add(36).write_volatile(6);
+            w.add(37).write_volatile(1);
+            w.add(38).write_volatile(1);
+        }
+
+        let (scratch1, scratch1_ptr, scratch1_gpu) = hw.upload_buffer(16 << 10);
+        let (scratch2, scratch2_ptr, scratch2_gpu) = hw.upload_buffer(16 << 10);
+        let mut gs = GatherState::default();
+        // SAFETY: recording gather -> mid-list flush -> scalar -> gather -> ExecuteIndirect.
+        unsafe {
+            hw.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+        for i in 0..4u64 {
+            assert!(gs.enqueue((&src, i * 16), None, (&dst, i * 16), (2, 12, 1), 0));
+        }
+        // Mid-list flush BEFORE a scalar clamp (mode7_barrier_after = true).
+        let s1 = gs
+            .flush_on(
+                &hw.device,
+                hw.gather,
+                &hw.list,
+                budget_gpu,
+                &budget,
+                true,
+                |_| Some((scratch1_gpu, scratch1_ptr)),
+            )
+            .unwrap();
+        assert_eq!(s1.items, 4);
+        assert_eq!(s1.barriers, 1);
+
+        // Intervening scalar clamp at dst offset 64.
+        record_scalar_into_uav(
+            hw.clamp,
+            &hw.list,
+            &dst,
+            64,
+            budget_gpu,
+            &budget,
+            (&src, 64),
+            None,
+            (2, 12, 1),
+            0,
+            true,
+        );
+
+        // Batch 2 after scalar clamp.
+        assert!(gs.enqueue((&src, 128), None, (&dst, 128), (2, 12, 1), 0));
+        assert!(gs.enqueue((&src, 144), None, (&dst, 144), (2, 12, 1), 0));
+        let s2 = gs
+            .flush_on(
+                &hw.device,
+                hw.gather,
+                &hw.list,
+                budget_gpu,
+                &budget,
+                false,
+                |_| Some((scratch2_gpu, scratch2_ptr)),
+            )
+            .unwrap();
+        assert_eq!(s2.items, 2);
+
+        let sig = hw.signature(2, 12);
+        // SAFETY: transition clamped scratch to INDIRECT_ARGUMENT and execute all 7 dispatches.
+        unsafe {
+            hw.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+            hw.list.SetComputeRootSignature(&hw.worker.root);
+            hw.list.SetPipelineState(&hw.worker.pso);
+            hw.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            for off in [0u64, 16, 32, 48, 64, 128, 144] {
+                hw.list.ExecuteIndirect(&sig, 1, &dst, off, None, 0);
+            }
+            hw.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        hw.submit_and_wait();
+        drop((scratch1, scratch2));
+
+        // Expected total worker hits: (3 + 5 + 7 + 0) + 11 + (4 + 6) = 36.
+        // Expected budget: 36 * 64 = 2304.
+        // SAFETY: reading completed buffers after fence.
+        let (got_hits, got_budget) = unsafe {
+            (
+                hits_ptr.cast::<u32>().read_volatile(),
+                budget_ptr.cast::<u32>().read_volatile(),
+            )
+        };
+        assert_eq!(got_hits, 36, "real GPU ExecuteIndirect hit count mismatch");
+        assert_eq!(got_budget, 36 * 64, "combined gather+scalar budget mismatch");
+        gs.reset();
+    }
+
+    /// End-to-end production `HostList::bound_before` -> `clamp_end` ->
+    /// `Host::execute` test on the real hardware GPU, verifying both
+    /// `VICTORY_INDIRECT_GATHER=1` and `VICTORY_INDIRECT_GATHER=0` produce
+    /// identical clamped output and reset cleanly across multiple frames.
+    #[test]
+    fn hw_gather_hostlist_bound_before_end_to_end() {
+        let require_hw = std::env::var_os("VICTORY_REQUIRE_HW_GPU").is_some_and(|v| v != "0");
+        let Some(host) = crate::host::host() else {
+            assert!(!require_hw, "VICTORY_REQUIRE_HW_GPU=1 set, but no host GPU");
+            return;
+        };
+        let (src, src_ptr) = host.shared_buffer(4096).expect("shared buffer");
+        // SAFETY: writing 4 scattered indirect draw records + 1 wide record (64 records).
+        unsafe {
+            let w = src_ptr.cast::<u32>();
+            for i in 0..4usize {
+                let base = i * 8;
+                w.add(base).write_volatile(120 + i as u32 * 10);
+                w.add(base + 1).write_volatile(2);
+                w.add(base + 2).write_volatile(i as u32);
+                w.add(base + 3).write_volatile(77 + i as u32);
+            }
+            // Record 4 (overflow): vertices > 1<<24 -> clamped to 1<<24, instances clamped to 4.
+            w.add(32).write_volatile(0xFFFF_FFFF);
+            w.add(33).write_volatile(0xFFFF_FFFF);
+            w.add(34).write_volatile(9);
+            w.add(35).write_volatile(13);
+        }
+
+        let clamps = host.new_list().expect("host list");
+        let mut outs = Vec::new();
+        for i in 0..5u64 {
+            let out = bound_before(&clamps, (&src, i * 32), None, (0, 16, 1))
+                .expect("bound_before must succeed");
+            outs.push(out);
+        }
+        clamps.clamp_end();
+        clamps.close();
+        host.execute(&[&clamps]);
+
+        // Read back the clamped chunk buffer through a second copy list.
+        let copy_list = host.new_list().expect("copy list");
+        let rb = buffer(
+            &host.device,
+            256,
+            D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        // SAFETY: `outs[0].0` is in INDIRECT_ARGUMENT after `clamp_end`; copy to readback.
+        unsafe {
+            copy_list.list.ResourceBarrier(&[transition(
+                &outs[0].0,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            copy_list.list.CopyBufferRegion(&rb, 0, &outs[0].0, 0, 256);
+            copy_list.list.ResourceBarrier(&[transition(
+                &outs[0].0,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
+        copy_list.close();
+        host.execute(&[&copy_list]);
+
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: 256 };
+        // SAFETY: reading completed readback buffer.
+        let words = unsafe {
+            rb.Map(0, Some(&range), Some(&mut data)).unwrap();
+            let v = std::slice::from_raw_parts(data.cast::<u32>(), 64).to_vec();
+            rb.Unmap(0, None);
+            v
+        };
+        for (i, (_, at)) in outs.iter().enumerate() {
+            let base = (*at / 4) as usize;
+            if i < 4 {
+                assert_eq!(
+                    &words[base..base + 4],
+                    &[120 + i as u32 * 10, 2, i as u32, 77 + i as u32]
+                );
+            } else {
+                assert_eq!(&words[base..base + 4], &[1u32 << 24, 4, 9, 13]);
+            }
+        }
+        // Reset and reuse `clamps` for a second frame to verify clean reset.
+        clamps.reset();
+        let out2 = bound_before(&clamps, (&src, 0), None, (0, 16, 1)).expect("second frame bound_before");
+        assert_eq!(out2.1, 0);
+        clamps.clamp_end();
+        clamps.close();
+        host.execute(&[&clamps]);
+    }
+
+    /// Real-GPU benchmark comparing BEFORE (scalar Mode 7: 256 per-record
+    /// dispatches + 256 budget UAV barriers) vs AFTER (gather-clamp batching:
+    /// single-pass 1-buffer, two-pass 16-buffer, two-pass 256-distinct-buffer)
+    /// on 256 scattered indirect records.
+    #[test]
+    #[ignore = "hardware benchmark: run with --ignored --nocapture"]
+    fn hw_bench_scattered_indirect_gather_before_vs_after() {
+        let Some(mut hw) = HwGatherHarness::new() else {
+            eprintln!("no hardware adapter; skipped");
+            return;
+        };
+        const RECORDS: usize = 256;
+        const STRIDE: u32 = 20;
+        const SLOT_ALIGN: u64 = 32;
+        const ITERS: usize = 15;
+        let total_bytes = (RECORDS as u64 * SLOT_ALIGN).next_multiple_of(256);
+
+        let dst = hw.default_uav(total_bytes);
+        let (budget, budget_ptr, budget_gpu) = hw.shared_buffer(256);
+        let (scratch_res, scratch_ptr, scratch_gpu) = hw.upload_buffer(128 << 10);
+
+        eprintln!(
+            "Scattered indirect gather-clamp benchmark on {} ({RECORDS} scattered records, {ITERS} iterations, VICTORY_INDIRECT_GATHER={})",
+            hw.card,
+            u8::from(gather_enabled())
+        );
+
+        for (label, num_bufs) in [
+            ("1 shared arg buffer (256 scattered offsets)", 1usize),
+            ("16 arg buffers (interleaved)", 16usize),
+            ("256 distinct arg buffers", 256usize),
+        ] {
+            let mut src_bufs = Vec::with_capacity(num_bufs);
+            for _ in 0..num_bufs {
+                src_bufs.push(hw.shared_buffer(16 << 10));
+            }
+            for i in 0..RECORDS {
+                let b = i % num_bufs;
+                let off = (i / num_bufs) * 32;
+                // SAFETY: writing 20 bytes inside mapped 16 KiB buffer.
+                unsafe {
+                    let p = src_bufs[b].1.add(off).cast::<u32>();
+                    p.add(0).write_volatile(300 + (i as u32 % 64));
+                    p.add(1).write_volatile(1);
+                    p.add(2).write_volatile(0);
+                    p.add(3).write_volatile(0);
+                    p.add(4).write_volatile(i as u32);
+                }
+            }
+
+            let mut scalar_cpu_us = Vec::with_capacity(ITERS);
+            let mut scalar_gpu_ms = Vec::with_capacity(ITERS);
+            for iter in 0..=ITERS {
+                // SAFETY: zeroing budget and timing scalar Mode 7 path.
+                unsafe {
+                    for k in 0..3 {
+                        budget_ptr.cast::<u32>().add(k).write_volatile(0);
+                    }
+                    hw.list.ResourceBarrier(&[transition(
+                        &dst,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+                    hw.list.EndQuery(&hw.stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                }
+                let t0 = std::time::Instant::now();
+                for i in 0..RECORDS {
+                    let b = i % num_bufs;
+                    let src_off = ((i / num_bufs) * 32) as u64;
+                    record_scalar_into_uav(
+                        hw.clamp,
+                        &hw.list,
+                        &dst,
+                        (i as u64) * SLOT_ALIGN,
+                        budget_gpu,
+                        &budget,
+                        (&src_bufs[b].0, src_off),
+                        None,
+                        (1, STRIDE, 1),
+                        0,
+                        true,
+                    );
+                }
+                let rec_us = t0.elapsed().as_secs_f64() * 1e6;
+                // SAFETY: resolve GPU timestamps and return dst to COMMON.
+                unsafe {
+                    hw.list.ResourceBarrier(&[transition(
+                        &dst,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    )]);
+                    hw.list.EndQuery(&hw.stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                    hw.list.ResolveQueryData(
+                        &hw.stamps,
+                        D3D12_QUERY_TYPE_TIMESTAMP,
+                        0,
+                        2,
+                        &hw.stamp_readback,
+                        0,
+                    );
+                    hw.list.ResourceBarrier(&[transition(
+                        &dst,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
+                hw.submit_and_wait();
+                if iter > 0 {
+                    scalar_cpu_us.push(rec_us);
+                    scalar_gpu_ms.push(hw.read_timestamp_ms());
+                }
+            }
+
+            let mut gather_state = GatherState::default();
+            let mut gather_cpu_us = Vec::with_capacity(ITERS);
+            let mut gather_gpu_ms = Vec::with_capacity(ITERS);
+            let mut last_stats = GatherFlushStats::default();
+            for iter in 0..=ITERS {
+                // SAFETY: zeroing budget and timing gather-clamp path.
+                unsafe {
+                    for k in 0..3 {
+                        budget_ptr.cast::<u32>().add(k).write_volatile(0);
+                    }
+                    hw.list.ResourceBarrier(&[transition(
+                        &dst,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+                    hw.list.EndQuery(&hw.stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                }
+                let t0 = std::time::Instant::now();
+                for i in 0..RECORDS {
+                    let b = i % num_bufs;
+                    let src_off = ((i / num_bufs) * 32) as u64;
+                    assert!(gather_state.enqueue(
+                        (&src_bufs[b].0, src_off),
+                        None,
+                        (&dst, (i as u64) * SLOT_ALIGN),
+                        (1, STRIDE, 1),
+                        0,
+                    ));
+                }
+                last_stats = gather_state
+                    .flush_on(
+                        &hw.device,
+                        hw.gather,
+                        &hw.list,
+                        budget_gpu,
+                        &budget,
+                        false,
+                        |len| (len <= (128 << 10)).then_some((scratch_gpu, scratch_ptr)),
+                    )
+                    .unwrap();
+                let rec_us = t0.elapsed().as_secs_f64() * 1e6;
+                // SAFETY: transition to INDIRECT_ARGUMENT, resolve GPU timestamps, return to COMMON.
+                unsafe {
+                    hw.list.ResourceBarrier(&[transition(
+                        &dst,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    )]);
+                    hw.list.EndQuery(&hw.stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                    hw.list.ResolveQueryData(
+                        &hw.stamps,
+                        D3D12_QUERY_TYPE_TIMESTAMP,
+                        0,
+                        2,
+                        &hw.stamp_readback,
+                        0,
+                    );
+                    hw.list.ResourceBarrier(&[transition(
+                        &dst,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
+                hw.submit_and_wait();
+                gather_state.reset();
+                if iter > 0 {
+                    gather_cpu_us.push(rec_us);
+                    gather_gpu_ms.push(hw.read_timestamp_ms());
+                }
+            }
+
+            let median = |v: &mut Vec<f64>| -> f64 {
+                v.sort_by(f64::total_cmp);
+                v[v.len() / 2]
+            };
+            let s_cpu = median(&mut scalar_cpu_us);
+            let s_gpu = median(&mut scalar_gpu_ms);
+            let g_cpu = median(&mut gather_cpu_us);
+            let g_gpu = median(&mut gather_gpu_ms);
+            eprintln!(
+                "  [{label}]\n    BEFORE (scalar Mode 7): dispatches={RECORDS}, uav_barriers={RECORDS}, cpu_rec={s_cpu:.1} us, gpu={s_gpu:.4} ms\n    AFTER  (gather-clamp) : dispatches={}, uav_barriers={}, groups={}, two_pass={}, cpu_rec={g_cpu:.1} us ({:.2}x), gpu={g_gpu:.4} ms ({:.2}x)",
+                last_stats.dispatches,
+                last_stats.barriers,
+                last_stats.groups,
+                last_stats.two_pass,
+                s_cpu / g_cpu.max(1e-6),
+                s_gpu / g_gpu.max(1e-6),
+            );
+            assert!(g_gpu.is_finite() && s_gpu.is_finite());
+        }
+        drop(scratch_res);
     }
 }

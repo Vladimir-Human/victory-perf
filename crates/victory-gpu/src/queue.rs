@@ -120,6 +120,103 @@ fn forces() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_FORCE").is_none_or(|v| v != "0"))
 }
 
+#[cfg(all(windows, test))]
+static QUEUE_SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_JOIN_PARTS` (on by default, `=0` disables): coalesces consecutive
+/// ready submission parts in a queue into fewer `ExecuteCommandLists`
+/// submissions when no unsatisfied wait, fence signal, or copy-back/readback
+/// hazard separates them.
+#[cfg(windows)]
+pub(crate) fn join_parts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_JOIN_PARTS").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!("consecutive submission part coalescing off (VICTORY_JOIN_PARTS=0)");
+        }
+        on
+    })
+}
+
+/// Coalesces consecutive ready `Held::Run` entries at the front of `held` into
+/// `(lists, order)`, crossing only already-satisfied `Held::Wait`/`Held::Value`
+/// gates (or forced waits when `all` is true) and stopping before any
+/// `Held::Signal`, unsatisfied wait, or copy-back/readback hazard. Returns the
+/// number of additional parts joined into the initial run.
+#[cfg(windows)]
+fn coalesce_held_runs(
+    q: usize,
+    all: bool,
+    held: &mut Vec<Held>,
+    lists: &mut Vec<crate::list::Detached>,
+    order: &mut Vec<usize>,
+) -> usize {
+    let mut joined = 0usize;
+    loop {
+        // Peek past any satisfied `Wait` / `Value` gates to the next `Run`.
+        let mut scan = 0usize;
+        let can_cross = loop {
+            match held.get(scan) {
+                Some(&Held::Wait(fence, value)) => {
+                    if !all && crate::fence::completed(fence as This) < value {
+                        break false;
+                    }
+                    scan += 1;
+                }
+                Some(Held::Value(wait)) => {
+                    if !all && !value_met(wait) {
+                        break false;
+                    }
+                    scan += 1;
+                }
+                Some(Held::Run(..)) => break true,
+                Some(Held::Signal(..)) | None => break false,
+            }
+        };
+        if !can_cross {
+            break;
+        }
+        let Some(Held::Run(next_lists, next_order)) = held.get(scan) else {
+            break;
+        };
+        let safe = {
+            let earlier_hosts: Vec<&crate::host::HostList> =
+                order.iter().map(|&i| lists[i].host()).collect();
+            let next_hosts: Vec<&crate::host::HostList> =
+                next_order.iter().map(|&i| next_lists[i].host()).collect();
+            crate::host::parts_can_join(&earlier_hosts, &next_hosts)
+        };
+        if !safe {
+            break;
+        }
+        // Consume the satisfied gates and the next `Held::Run`, preserving
+        // forced-wait diagnostics when `all` is true.
+        for item in held.drain(..scan) {
+            if let Held::Value(wait) = item
+                && all
+                && !value_met(&wait)
+            {
+                static SEEN: AtomicU64 = AtomicU64::new(0);
+                if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
+                    tracing::warn!(
+                        queue = format_args!("{q:#x}"),
+                        ?wait,
+                        "a wait for a memory value was not met at a present: the queue runs on"
+                    );
+                }
+            }
+        }
+        if let Held::Run(next_lists, next_order) = held.remove(0) {
+            let base = lists.len();
+            lists.extend(next_lists);
+            order.extend(next_order.into_iter().map(|i| base + i));
+            joined += 1;
+        }
+    }
+    joined
+}
+
 /// A submission to a queue whose lists are cut at their waits ([`cuts`]).
 /// The lists before the first one that waits run at once if the queue
 /// holds nothing; the rest goes behind what the queue holds, part by part
@@ -347,28 +444,41 @@ pub(crate) fn release_held(all: bool) {
                             }
                         }
                     }
-                    Held::Run(lists, order) => {
-                        #[cfg(feature = "diagnostics")]
-                        crate::capture::op(q, || {
-                            format!(
-                                "RUN held submission of {} lists (forced {all})",
-                                order.len()
-                            )
-                        });
-                        // Diagnostics: the part behind this one stands at
-                        // waits that are met already, so the two could have
-                        // been one host submission (one wait for the card,
-                        // each range shaders write compared once).
+                    Held::Run(mut lists, mut order) => {
+                        let joined = if join_parts() {
+                            coalesce_held_runs(q, all, &mut held, &mut lists, &mut order)
+                        } else {
+                            0
+                        };
                         #[cfg(feature = "diagnostics")]
                         {
-                            let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
-                            if waits > 0
-                                && matches!(held.get(waits), Some(Held::Run(..)))
-                                && held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
-                            {
-                                crate::copystat::add(crate::copystat::C::PartsTogether, 1);
+                            if joined > 0 {
+                                crate::copystat::add(
+                                    crate::copystat::C::PartsTogether,
+                                    joined as u64,
+                                );
+                            } else if !join_parts() {
+                                let waits =
+                                    held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
+                                if waits > 0
+                                    && matches!(held.get(waits), Some(Held::Run(..)))
+                                    && held[..waits]
+                                        .iter()
+                                        .all(|h| matches!(h, Held::Value(w) if w.met()))
+                                {
+                                    crate::copystat::add(crate::copystat::C::PartsTogether, 1);
+                                }
                             }
+                            crate::capture::op(q, || {
+                                format!(
+                                    "RUN held submission of {} lists (joined {joined}, forced {all})",
+                                    order.len()
+                                )
+                            });
                         }
+                        let _ = joined;
+                        #[cfg(test)]
+                        QUEUE_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
                         if crate::host::late()
                             && let Some(host) = crate::host::host()
                         {
@@ -1119,5 +1229,322 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    static QUEUE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Inspects `list`'s own vtable to decide whether it uses the newer
+    /// console layout (+2 slots from `0x1d8` onward), avoiding races with
+    /// parallel device-layout tests.
+    #[cfg(windows)]
+    fn list_slot_offset(list: This, old_offset: usize) -> usize {
+        if old_offset < 0x1d8 {
+            return old_offset;
+        }
+        // SAFETY: one of our command lists whose first field is its 160-entry
+        // vtable; `sync` occupies two adjacent slots: (129, 130) in the older
+        // layout and (131, 132) in the newer layout (unused slots have distinct
+        // per-slot `missing` stubs).
+        let newer = unsafe {
+            let table = *list.cast::<*const *const ()>();
+            *table.add(131) == *table.add(132)
+        };
+        if newer { old_offset + 0x10 } else { old_offset }
+    }
+
+    /// Real-GPU test of `VICTORY_JOIN_PARTS` coalescing and negative controls:
+    /// 1. Consecutive ready parts across satisfied `ValueWait`s coalesce into
+    ///    one `ExecuteCommandLists` submission when `join_parts()` is true.
+    /// 2. Unsatisfied `ValueWait` blocks coalescing until satisfied.
+    /// 3. Intervening `Held::Signal` blocks coalescing and preserves fence order.
+    /// 4. Readback / overlapping bottom-of-pipe write hazard blocks coalescing
+    ///    (`parts_can_join` == false), while non-overlapping writes coalesce.
+    #[cfg(windows)]
+    #[test]
+    fn hw_coalesce_ready_parts_and_negative_controls() {
+        let _guard = QUEUE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let require_hw = std::env::var_os("VICTORY_REQUIRE_HW_GPU").is_some_and(|v| v != "0");
+        let Some(host) = crate::host::host() else {
+            assert!(!require_hw, "VICTORY_REQUIRE_HW_GPU=1 set, but no host GPU");
+            return;
+        };
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        let alloc_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        assert_eq!(crate::list::create_allocator(null, 0, &alloc_iid, &mut allocator), S_OK);
+        let make_list = || -> This {
+            let mut l = null;
+            assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut l), S_OK);
+            l
+        };
+        let write32_on = |l: This, addr: u64, val: u32| {
+            let f = slot::<extern "system" fn(This, u64, u32, u32, u32)>(l, list_slot_offset(l, 0x228));
+            f(l, addr, val, 0, 0);
+        };
+        let wait32_on = |l: This, addr: u64, cmp: u32, val: u64| {
+            let f = slot::<extern "system" fn(This, u64, u32, u64)>(l, list_slot_offset(l, 0x238));
+            f(l, addr, cmp, val);
+        };
+        let close_on = |l: This| {
+            let f = slot::<extern "system" fn(This) -> HRESULT>(l, 0x48);
+            assert_eq!(f(l), S_OK);
+        };
+        let release_obj = |o: This| {
+            slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        };
+
+        // Create queue + fence.
+        let qdesc = QueueDesc { kind: 0, priority: 0, flags: 0, nodes: 0 };
+        let mut q = null;
+        assert_eq!(create(null, &qdesc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut fence = null;
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+            S_OK
+        );
+
+        // --- Case 1: 4 consecutive ready parts behind satisfied ValueWaits ---
+        let ready_flags = Box::new([1u32; 4]);
+        let mut out_words = Box::new([0u32; 4]);
+        let l1 = make_list();
+        for i in 0..4usize {
+            if i > 0 {
+                // Comparison 3 == EQUAL: memory already holds 1.
+                wait32_on(l1, &raw const ready_flags[i] as u64, 3, 1);
+            }
+            write32_on(l1, &raw mut out_words[i] as u64, (i as u32 + 1) * 10);
+        }
+        close_on(l1);
+
+        let before_subs = QUEUE_SUBMISSIONS.load(Ordering::Relaxed);
+        execute(q, 1, &l1);
+        crate::host::settle_for_present();
+        let after_subs = QUEUE_SUBMISSIONS.load(Ordering::Relaxed);
+        assert_eq!(*out_words, [10, 20, 30, 40], "all 4 parts must execute in order");
+        if cuts() && join_parts() {
+            assert_eq!(
+                after_subs - before_subs,
+                1,
+                "4 ready parts must coalesce into 1 host submission when VICTORY_JOIN_PARTS=1"
+            );
+        } else if cuts() {
+            assert_eq!(
+                after_subs - before_subs,
+                4,
+                "4 parts must stay 4 separate host submissions when VICTORY_JOIN_PARTS=0"
+            );
+        }
+        release_obj(l1);
+
+        // --- Case 2 (Negative control): unsatisfied ValueWait blocks coalescing ---
+        let mut gate_flag = Box::new(0u32);
+        let mut neg_out = Box::new([0u32; 2]);
+        let l2 = make_list();
+        write32_on(l2, &raw mut neg_out[0] as u64, 111);
+        // Comparison 3 == EQUAL: currently 0 != 1, so part 2 MUST stay held!
+        wait32_on(l2, &raw const *gate_flag as u64, 3, 1);
+        write32_on(l2, &raw mut neg_out[1] as u64, 222);
+        close_on(l2);
+
+        let before_neg = QUEUE_SUBMISSIONS.load(Ordering::Relaxed);
+        execute(q, 1, &l2);
+        crate::host::settle_for_present();
+        // Part 1 ran, part 2 MUST NOT have run yet!
+        assert_eq!(neg_out[0], 111, "prefix before unsatisfied wait must run");
+        assert_eq!(neg_out[1], 0, "suffix behind unsatisfied wait must stay held");
+        let mid_neg = QUEUE_SUBMISSIONS.load(Ordering::Relaxed);
+        assert_eq!(mid_neg - before_neg, 1);
+
+        // Now satisfy the memory wait and release held work!
+        *gate_flag = 1;
+        release_held(false);
+        crate::host::settle_for_present();
+        assert_eq!(neg_out[1], 222, "suffix must run once wait value is satisfied");
+        let end_neg = QUEUE_SUBMISSIONS.load(Ordering::Relaxed);
+        assert_eq!(end_neg - before_neg, 2);
+        release_obj(l2);
+
+        // --- Case 3 (Negative control): intervening Held::Signal blocks coalescing ---
+        let mut sig_out = Box::new([0u32; 2]);
+        let mut fence_gate = null;
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence_gate),
+            S_OK
+        );
+        // Hold the queue behind `fence_gate == 1` so we can enqueue `[RunA, Signal(fence, 9), RunB]`.
+        let wait_fn = slot::<extern "system" fn(This, This, u64) -> HRESULT>(
+            q,
+            signal_slot(q) + 8,
+        );
+        let signal_fn = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
+        assert_eq!(wait_fn(q, fence_gate, 1), S_OK);
+        let la = make_list();
+        write32_on(la, &raw mut sig_out[0] as u64, 1);
+        close_on(la);
+        let lb = make_list();
+        write32_on(lb, &raw mut sig_out[1] as u64, 2);
+        close_on(lb);
+        execute(q, 1, &la);
+        assert_eq!(signal_fn(q, fence, 9), S_OK);
+        execute(q, 1, &lb);
+        assert_eq!(*sig_out, [0, 0], "both held behind fence_gate");
+        assert_eq!(crate::fence::completed(fence), 0);
+
+        let before_sig = QUEUE_SUBMISSIONS.load(Ordering::Relaxed);
+        assert_eq!(crate::fence::signal(fence_gate, 1), S_OK);
+        crate::host::settle_for_present();
+        let after_sig = QUEUE_SUBMISSIONS.load(Ordering::Relaxed);
+        assert_eq!(*sig_out, [1, 2]);
+        assert_eq!(crate::fence::completed(fence), 9);
+        assert_eq!(
+            after_sig - before_sig,
+            2,
+            "intervening Held::Signal must prevent coalescing RunA and RunB"
+        );
+        release_obj(la);
+        release_obj(lb);
+        release_obj(fence_gate);
+
+        // --- Case 4 (Negative control): readback / overlapping write hazard ---
+        let (hl_a, hl_b) = (host.new_list().unwrap(), host.new_list().unwrap());
+        let mut shared_mem = [0u8; 64];
+        let mut other_mem = [0u8; 64];
+        // Clean lists with no hazards can join.
+        assert!(crate::host::parts_can_join(&[&hl_a], &[&hl_b]));
+        // Non-overlapping bottom-of-pipe write in A vs Fill in B -> safe to join.
+        hl_a.defer_write(shared_mem.as_mut_ptr(), Written::Value(7), 4);
+        hl_b.defer_fill(other_mem.as_mut_ptr(), other_mem.as_ptr(), 4);
+        assert!(crate::host::parts_can_join(&[&hl_a], &[&hl_b]));
+        // Overlapping bottom-of-pipe write in A vs Fill reading the same bytes in B -> hazard!
+        hl_b.defer_fill(other_mem.as_mut_ptr(), shared_mem.as_ptr(), 4);
+        assert!(
+            !crate::host::parts_can_join(&[&hl_a], &[&hl_b]),
+            "overlapping bottom-of-pipe write and Fill must block coalescing"
+        );
+        // Readback in A always blocks coalescing with B.
+        let (hl_rb, hl_next) = (host.new_list().unwrap(), host.new_list().unwrap());
+        let (rb_buf, _) = host.shared_buffer(256).unwrap();
+        hl_rb.defer_read_back(rb_buf, shared_mem.as_mut_ptr(), [16, 1, 16]);
+        assert!(
+            !crate::host::parts_can_join(&[&hl_rb], &[&hl_next]),
+            "GPU->CPU readback in earlier part must block coalescing"
+        );
+        hl_a.close();
+        hl_b.close();
+        hl_rb.close();
+        hl_next.close();
+
+        release_obj(fence);
+        release_obj(q);
+        release_obj(allocator);
+    }
+
+    /// Real-GPU benchmark comparing BEFORE (16 split `ExecuteCommandLists`
+    /// submissions) vs AFTER (1 coalesced `ExecuteCommandLists` submission)
+    /// for a 16-part cut submission whose waits are already satisfied.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "hardware benchmark: run with --ignored --nocapture"]
+    fn hw_bench_join_parts_before_vs_after() {
+        let _guard = QUEUE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        const PARTS: usize = 16;
+        const ITERS: usize = 25;
+
+        let mut split_us = Vec::with_capacity(ITERS);
+        let mut joined_us = Vec::with_capacity(ITERS);
+        let mut lists: Vec<crate::host::HostList> = (0..PARTS)
+            .map(|_| {
+                let l = host.new_list().unwrap();
+                l.close();
+                l
+            })
+            .collect();
+        let refs: Vec<&crate::host::HostList> = lists.iter().collect();
+
+        // Warmup
+        host.execute(&refs);
+
+        for _ in 0..ITERS {
+            let t0 = std::time::Instant::now();
+            for r in &refs {
+                host.execute(&[*r]);
+            }
+            split_us.push(t0.elapsed().as_secs_f64() * 1e6);
+
+            let t1 = std::time::Instant::now();
+            host.execute(&refs);
+            joined_us.push(t1.elapsed().as_secs_f64() * 1e6);
+        }
+
+        // Also verify end-to-end `queue::execute` submission count with current VICTORY_JOIN_PARTS.
+        let null = std::ptr::null();
+        let alloc_iid = guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+        let list_iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+        let mut allocator = null;
+        assert_eq!(crate::list::create_allocator(null, 0, &alloc_iid, &mut allocator), S_OK);
+        let mut q = null;
+        let qdesc = QueueDesc { kind: 0, priority: 0, flags: 0, nodes: 0 };
+        assert_eq!(create(null, &qdesc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let ready = Box::new(1u32);
+        let mut sink = Box::new([0u32; PARTS]);
+        let mut e2e_us = Vec::with_capacity(ITERS);
+        let mut e2e_subs = 0u64;
+        for _ in 0..ITERS {
+            let mut l = null;
+            assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut l), S_OK);
+            let write32 = slot::<extern "system" fn(This, u64, u32, u32, u32)>(l, list_slot_offset(l, 0x228));
+            let wait32 = slot::<extern "system" fn(This, u64, u32, u64)>(l, list_slot_offset(l, 0x238));
+            for p in 0..PARTS {
+                if p > 0 {
+                    wait32(l, &raw const *ready as u64, 3, 1);
+                }
+                write32(l, &raw mut sink[p] as u64, p as u32 + 1, 0, 0);
+            }
+            let close = slot::<extern "system" fn(This) -> HRESULT>(l, 0x48);
+            assert_eq!(close(l), S_OK);
+            let s0 = QUEUE_SUBMISSIONS.load(Ordering::Relaxed);
+            let t = std::time::Instant::now();
+            execute(q, 1, &l);
+            crate::host::settle_for_present();
+            e2e_us.push(t.elapsed().as_secs_f64() * 1e6);
+            e2e_subs = QUEUE_SUBMISSIONS.load(Ordering::Relaxed) - s0;
+            slot::<extern "system" fn(This) -> u32>(l, 0x10)(l);
+        }
+        slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
+        slot::<extern "system" fn(This) -> u32>(allocator, 0x10)(allocator);
+        lists.clear();
+
+        let median = |v: &mut Vec<f64>| -> f64 {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let s_med = median(&mut split_us);
+        let j_med = median(&mut joined_us);
+        let e2e_med = median(&mut e2e_us);
+        eprintln!(
+            "Multi-part submission coalescing benchmark ({PARTS} ready parts, {ITERS} iterations, VICTORY_JOIN_PARTS={}):\n  BEFORE (16 split host submissions) : {s_med:.1} us ({:.3} ms)\n  AFTER  (1 coalesced submission)    : {j_med:.1} us ({:.3} ms) ({:.2}x speedup)\n  E2E queue::execute (subs={e2e_subs:2})      : {e2e_med:.1} us ({:.3} ms)",
+            u8::from(join_parts()),
+            s_med / 1e3,
+            j_med / 1e3,
+            s_med / j_med.max(1e-6),
+            e2e_med / 1e3,
+        );
     }
 }
