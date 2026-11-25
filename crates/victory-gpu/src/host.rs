@@ -775,6 +775,54 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn parts_can_join_blocks_war_refresh_copy_and_unknown_run_hazards() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let mut title_a = vec![0u8; 4096];
+        let mut title_b = vec![0u8; 4096];
+        let shadow = crate::shadow::find_any(title_a.as_ptr() as u64, 64)
+            .expect("find_any must create a Shadow for committed memory");
+        let (hl_e, hl_overlap, hl_disjoint, hl_known_run_overlap, hl_unknown_run) = (
+            host.new_list().unwrap(),
+            host.new_list().unwrap(),
+            host.new_list().unwrap(),
+            host.new_list().unwrap(),
+            host.new_list().unwrap(),
+        );
+        hl_e.defer_refresh(&shadow, title_a.as_ptr() as usize, 64);
+        hl_overlap.defer_copy(title_a.as_mut_ptr(), title_b.as_ptr(), 32);
+        hl_disjoint.defer_copy(title_b.as_mut_ptr(), title_a.as_ptr(), 32);
+        hl_known_run_overlap.deferred().copies.push(super::Step::Run(
+            Box::new(|| {}),
+            Some((title_a.as_ptr() as usize, title_b.as_ptr() as usize, 32)),
+        ));
+        hl_unknown_run
+            .deferred()
+            .copies
+            .push(super::Step::Run(Box::new(|| {}), None));
+        assert!(
+            !super::parts_can_join(&[&hl_e], &[&hl_overlap]),
+            "overlapping Copy after Refresh must block coalescing (WAR hazard)"
+        );
+        assert!(
+            super::parts_can_join(&[&hl_e], &[&hl_disjoint]),
+            "disjoint Copy after Refresh must remain joinable"
+        );
+        assert!(
+            !super::parts_can_join(&[&hl_e], &[&hl_known_run_overlap]),
+            "overlapping known-range Step::Run after Refresh must block coalescing (WAR hazard)"
+        );
+        assert!(
+            !super::parts_can_join(&[&hl_e], &[&hl_unknown_run]),
+            "unknown Step::Run after Refresh must block coalescing (WAR hazard)"
+        );
+        for l in [hl_e, hl_overlap, hl_disjoint, hl_known_run_overlap, hl_unknown_run] {
+            l.close();
+        }
+    }
+
+    #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
@@ -2399,13 +2447,60 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     None
 }
 
+/// Whether any list in `lists` may write to the title CPU memory range
+/// `[addr, addr + bytes)` (via GPU->CPU readbacks, bottom-of-pipe `writes`,
+/// shader `Step::GpuWrite` copy-backs, `Step::Copy` destinations, or
+/// `Step::Run` callbacks). Used by `queue::coalesce_held_runs` to prevent
+/// bypassing a `Held::Value` wait using stale CPU memory before `lists` run.
+pub(crate) fn lists_write_range(lists: &[&HostList], addr: usize, bytes: usize) -> bool {
+    if bytes == 0 {
+        return false;
+    }
+    let end = addr.saturating_add(bytes);
+    for list in lists {
+        let deferred = list.deferred();
+        if !deferred.backs.is_empty() {
+            return true;
+        }
+        for &(at, _, n) in &deferred.writes {
+            if n > 0 && addr < at.saturating_add(n) && at < end {
+                return true;
+            }
+        }
+        for step in &deferred.copies {
+            match step {
+                Step::GpuWrite(_, a, len) => {
+                    if *len > 0 && addr < a.saturating_add(*len) && *a < end {
+                        return true;
+                    }
+                }
+                &Step::Copy(dst, _, len) => {
+                    if len > 0 && addr < dst.saturating_add(len) && dst < end {
+                        return true;
+                    }
+                }
+                &Step::Run(_, Some((dst, _, len))) if crate::memcopy::known_writes() => {
+                    if len > 0 && addr < dst.saturating_add(len) && dst < end {
+                        return true;
+                    }
+                }
+                Step::Run(..) => return true,
+                Step::Fill(..) | Step::Refresh(..) | Step::Texture(..) | Step::Host(_) => {}
+            }
+        }
+    }
+    false
+}
+
 /// Whether two consecutive ready submission parts (`earlier` followed by `next`)
 /// can be coalesced into one `ExecuteCommandLists` submission without violating
-/// copy-back, readback, bottom-of-pipe write, or cross-shadow aliasing order.
+/// copy-back, readback, bottom-of-pipe write, WAR shadow/texture refresh, or
+/// cross-shadow aliasing order.
 pub(crate) fn parts_can_join(earlier: &[&HostList], next: &[&HostList]) -> bool {
     let mut gpu_writes: Vec<(usize, usize)> = Vec::new();
     let mut gpu_shadows: Vec<(usize, usize, usize)> = Vec::new();
     let mut cpu_writes: Vec<(usize, usize)> = Vec::new();
+    let mut earlier_reads: Vec<(usize, usize)> = Vec::new();
     for list in earlier {
         let deferred = list.deferred();
         // GPU->CPU readbacks write title memory after `earlier` finishes.
@@ -2418,22 +2513,34 @@ pub(crate) fn parts_can_join(earlier: &[&HostList], next: &[&HostList]) -> bool 
             }
         }
         for step in &deferred.copies {
-            if let Step::GpuWrite(shadow, address, len) = step
-                && *len > 0
-            {
-                let end = address.saturating_add(*len);
-                gpu_writes.push((*address, end));
-                gpu_shadows.push((std::sync::Arc::as_ptr(shadow) as usize, *address, end));
+            match step {
+                Step::GpuWrite(shadow, address, len) if *len > 0 => {
+                    let end = address.saturating_add(*len);
+                    gpu_writes.push((*address, end));
+                    gpu_shadows.push((std::sync::Arc::as_ptr(shadow) as usize, *address, end));
+                }
+                Step::Refresh(_, address, len) if *len > 0 => {
+                    earlier_reads.push((*address, address.saturating_add(*len)));
+                }
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    if len > 0 {
+                        earlier_reads.push((at, at.saturating_add(len)));
+                    }
+                }
+                _ => {}
             }
         }
     }
-    if gpu_writes.is_empty() && cpu_writes.is_empty() {
+    if gpu_writes.is_empty() && cpu_writes.is_empty() && earlier_reads.is_empty() {
         return true;
     }
     let mut merged_gpu = Vec::new();
     join_ranges(&mut merged_gpu, gpu_writes);
     let mut merged_cpu = Vec::new();
     join_ranges(&mut merged_cpu, cpu_writes);
+    let mut merged_reads = Vec::new();
+    join_ranges(&mut merged_reads, earlier_reads);
 
     if !merged_gpu.is_empty() && blocked_by(&merged_gpu, next, false).is_some() {
         return false;
@@ -2444,23 +2551,49 @@ pub(crate) fn parts_can_join(earlier: &[&HostList], next: &[&HostList]) -> bool 
     for list in next {
         let deferred = list.deferred();
         for step in &deferred.copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && *len > 0
-            {
-                let end = address.saturating_add(*len);
-                // Bottom-of-pipe CPU writes in `earlier` must land before `next` refreshes them.
-                if !merged_cpu.is_empty() && touches(&merged_cpu, *address, end) {
-                    return false;
+            match step {
+                &Step::Copy(dst, _, len) if len > 0 => {
+                    // WAR hazard: `next`'s title-memory write runs before GPU
+                    // executes `earlier`, so a subsequent refresh/detile would
+                    // overwrite `earlier`'s shadow/texture data in place.
+                    if !merged_reads.is_empty()
+                        && touches(&merged_reads, dst, dst.saturating_add(len))
+                    {
+                        return false;
+                    }
                 }
-                // Different host shadow buffers aliasing the same title range need
-                // `earlier`'s GPU copy-back before `next`'s shadow refreshes from CPU memory.
-                let ptr = std::sync::Arc::as_ptr(shadow) as usize;
-                if gpu_shadows
-                    .iter()
-                    .any(|&(s_ptr, lo, hi)| s_ptr != ptr && *address < hi && lo < end)
-                {
-                    return false;
+                &Step::Run(_, Some((dst, _, len))) if crate::memcopy::known_writes() => {
+                    if len > 0
+                        && !merged_reads.is_empty()
+                        && touches(&merged_reads, dst, dst.saturating_add(len))
+                    {
+                        return false;
+                    }
                 }
+                Step::Run(..) => {
+                    // Unknown CPU title-memory write in `next` may clobber
+                    // ranges `earlier` refreshes or textures it stages.
+                    if !merged_reads.is_empty() {
+                        return false;
+                    }
+                }
+                Step::Refresh(shadow, address, len) if *len > 0 => {
+                    let end = address.saturating_add(*len);
+                    // Bottom-of-pipe CPU writes in `earlier` must land before `next` refreshes them.
+                    if !merged_cpu.is_empty() && touches(&merged_cpu, *address, end) {
+                        return false;
+                    }
+                    // Different host shadow buffers aliasing the same title range need
+                    // `earlier`'s GPU copy-back before `next`'s shadow refreshes from CPU memory.
+                    let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+                    if gpu_shadows
+                        .iter()
+                        .any(|&(s_ptr, lo, hi)| s_ptr != ptr && *address < hi && lo < end)
+                    {
+                        return false;
+                    }
+                }
+                _ => {}
             }
         }
     }

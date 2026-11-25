@@ -154,6 +154,8 @@ fn coalesce_held_runs(
 ) -> usize {
     let mut joined = 0usize;
     loop {
+        let earlier_hosts: Vec<&crate::host::HostList> =
+            order.iter().map(|&i| lists[i].host()).collect();
         // Peek past any satisfied `Wait` / `Value` gates to the next `Run`.
         let mut scan = 0usize;
         let can_cross = loop {
@@ -165,8 +167,16 @@ fn coalesce_held_runs(
                     scan += 1;
                 }
                 Some(Held::Value(wait)) => {
-                    if !all && !value_met(wait) {
-                        break false;
+                    if !all {
+                        // If `earlier` itself writes to the waited-on memory
+                        // (e.g. resetting a flag before a wait), `value_met`
+                        // would observe stale CPU memory; run `earlier` first.
+                        let (addr, bytes) = wait.place();
+                        if crate::host::lists_write_range(&earlier_hosts, addr, bytes)
+                            || !value_met(wait)
+                        {
+                            break false;
+                        }
                     }
                     scan += 1;
                 }
@@ -181,8 +191,6 @@ fn coalesce_held_runs(
             break;
         };
         let safe = {
-            let earlier_hosts: Vec<&crate::host::HostList> =
-                order.iter().map(|&i| lists[i].host()).collect();
             let next_hosts: Vec<&crate::host::HostList> =
                 next_order.iter().map(|&i| next_lists[i].host()).collect();
             crate::host::parts_can_join(&earlier_hosts, &next_hosts)
@@ -1446,6 +1454,60 @@ mod tests {
         hl_b.close();
         hl_rb.close();
         hl_next.close();
+
+        // --- Case 5 (F4 regression): earlier part resets a currently-met ValueWait ---
+        // Initially `*reset_flag == 1` (wait condition EQUAL 1 appears met on CPU).
+        // Part 0 resets `*reset_flag = 0` via bottom-of-pipe write, followed by
+        // `Wait(reset_flag == 1)`, followed by Part 1 writing `reset_out = 999`.
+        // `coalesce_held_runs` MUST NOT bypass the wait using stale CPU memory!
+        let mut reset_flag = Box::new(1u32);
+        let mut reset_out = Box::new(0u32);
+        let l5 = make_list();
+        write32_on(l5, &raw mut *reset_flag as u64, 0);
+        wait32_on(l5, &raw const *reset_flag as u64, 3, 1);
+        write32_on(l5, &raw mut *reset_out as u64, 999);
+        close_on(l5);
+
+        let before_f4 = QUEUE_SUBMISSIONS.load(Ordering::Relaxed);
+        execute(q, 1, &l5);
+        crate::host::settle_for_present();
+        assert_eq!(*reset_flag, 0, "part 0 must execute and reset flag to 0");
+        assert_eq!(
+            *reset_out, 0,
+            "part 1 must NOT bypass ValueWait using stale pre-part-0 CPU memory"
+        );
+        assert_eq!(QUEUE_SUBMISSIONS.load(Ordering::Relaxed) - before_f4, 1);
+
+        // Once another queue/CPU restores `*reset_flag = 1`, part 1 runs.
+        *reset_flag = 1;
+        release_held(false);
+        crate::host::settle_for_present();
+        assert_eq!(*reset_out, 999, "part 1 must execute once flag becomes 1 again");
+        assert_eq!(QUEUE_SUBMISSIONS.load(Ordering::Relaxed) - before_f4, 2);
+        release_obj(l5);
+
+        // --- Case 6 (F4/F3 helper regression): `lists_write_range` detects
+        // overlapping `defer_copy` destinations and ignores disjoint ones ---
+        let (hl_wr_overlap, hl_wr_disjoint) = (
+            host.new_list().unwrap(),
+            host.new_list().unwrap(),
+        );
+        let mut war_buf_a = [0u8; 64];
+        let mut war_buf_b = [0u8; 64];
+        hl_wr_overlap.defer_copy(war_buf_a.as_mut_ptr(), war_buf_b.as_ptr(), 32);
+        hl_wr_disjoint.defer_copy(war_buf_b.as_mut_ptr(), war_buf_a.as_ptr(), 32);
+        assert!(crate::host::lists_write_range(
+            &[&hl_wr_overlap],
+            war_buf_a.as_ptr() as usize,
+            4,
+        ));
+        assert!(!crate::host::lists_write_range(
+            &[&hl_wr_disjoint],
+            war_buf_a.as_ptr() as usize,
+            4,
+        ));
+        hl_wr_overlap.close();
+        hl_wr_disjoint.close();
 
         release_obj(fence);
         release_obj(q);

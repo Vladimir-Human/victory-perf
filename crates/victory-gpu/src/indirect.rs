@@ -1209,13 +1209,17 @@ impl GatherState {
     }
 
     fn raw_num_elements(res: &ID3D12Resource, required_end: u64) -> Option<u32> {
+        // `ByteAddressBuffer` addresses bytes via 32-bit offsets (max 2^30 - 1
+        // 32-bit raw words so `NumElements * 4` stays strictly within `u32`).
+        const MAX_RAW_ELEMS: u64 = (1u64 << 30) - 1;
+        const MAX_RAW_BYTES: u64 = MAX_RAW_ELEMS * 4;
         // SAFETY: live D3D12 buffer resource.
         let width = unsafe { res.GetDesc().Width };
-        if width < 4 || required_end > width {
+        if width < 4 || required_end > width || required_end > MAX_RAW_BYTES {
             return None;
         }
-        let elems = width / 4;
-        (elems <= u64::from(u32::MAX)).then_some(elems as u32)
+        let elems = (width / 4).min(MAX_RAW_ELEMS);
+        Some(elems as u32)
     }
 
     fn would_overflow(&self, records: u32, src: &ID3D12Resource, count: Option<&ID3D12Resource>, dst: &ID3D12Resource) -> bool {
@@ -1414,17 +1418,109 @@ impl GatherState {
         Some(buf)
     }
 
+    /// Scalar fallback for [`Self::flush_on`] when gather scratch/heap/costs
+    /// allocation fails: reconstructs each original call from consecutive
+    /// `rec_idx = 0..records` runs in `pending` and records scalar `SOURCE`
+    /// compute dispatches using root SRVs/UAVs/constants only (zero extra
+    /// allocations). Keeps all referenced resources alive until `reset`.
+    #[allow(clippy::too_many_arguments)]
+    fn record_pending_scalar(
+        &mut self,
+        c: &Clamp,
+        cmd_list: &ID3D12GraphicsCommandList,
+        pending: &[PendingItem],
+        srvs: Vec<(ID3D12Resource, u32)>,
+        uavs: Vec<(ID3D12Resource, u32)>,
+        budget_gpu: u64,
+        budget_res: &ID3D12Resource,
+        budget_barrier_after: bool,
+    ) -> GatherFlushStats {
+        let mut dispatches = 0u32;
+        let mut barriers = 0u32;
+        let mut i = 0usize;
+        while i < pending.len() {
+            let first = &pending[i];
+            let mut run = 1usize;
+            while i + run < pending.len() {
+                let next = &pending[i + run];
+                let step = (run as u32).saturating_mul(first.stride);
+                if next.rec_idx == run as u32
+                    && next.kind == first.kind
+                    && next.stride == first.stride
+                    && next.flags == first.flags
+                    && next.src_idx == first.src_idx
+                    && next.count_idx == first.count_idx
+                    && next.count_offset == first.count_offset
+                    && next.dst_idx == first.dst_idx
+                    && next.src_offset == first.src_offset.wrapping_add(step)
+                    && next.dst_offset == first.dst_offset.wrapping_add(step)
+                {
+                    run += 1;
+                } else {
+                    break;
+                }
+            }
+            let records = run as u32;
+            let src_res = &srvs[first.src_idx as usize].0;
+            let count_res = &srvs[first.count_idx as usize].0;
+            let dst_res = &uavs[first.dst_idx as usize].0;
+            // SAFETY: open command list, live buffers/PSOs, valid offsets validated at enqueue.
+            unsafe {
+                let src_gpu = src_res.GetGPUVirtualAddress();
+                let count_gpu = count_res.GetGPUVirtualAddress();
+                let dst_gpu = dst_res.GetGPUVirtualAddress() + u64::from(first.dst_offset);
+                let constants = [
+                    first.kind,
+                    first.stride,
+                    records,
+                    first.src_offset,
+                    first.flags,
+                    first.count_offset,
+                ];
+                cmd_list.SetComputeRootSignature(&c.root);
+                cmd_list.SetPipelineState(&c.pso);
+                cmd_list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                cmd_list.SetComputeRootShaderResourceView(1, src_gpu);
+                cmd_list.SetComputeRootShaderResourceView(2, count_gpu);
+                cmd_list.SetComputeRootUnorderedAccessView(3, dst_gpu);
+                cmd_list.SetComputeRootUnorderedAccessView(4, budget_gpu);
+                cmd_list.Dispatch(records.div_ceil(64), 1, 1);
+                dispatches += 1;
+                if i + run < pending.len() || budget_barrier_after {
+                    cmd_list.ResourceBarrier(&[uav_barrier_on(budget_res)]);
+                    barriers += 1;
+                }
+            }
+            i += run;
+        }
+        self.kept_resources.extend(srvs.into_iter().map(|(r, _)| r));
+        self.kept_resources.extend(uavs.into_iter().map(|(r, _)| r));
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::IndirectBounded, u64::from(dispatches));
+        GatherFlushStats {
+            items: pending.len() as u32,
+            groups: 0,
+            dispatches,
+            barriers,
+            two_pass: false,
+        }
+    }
+
     /// Flushes all pending gathered clamps onto `cmd_list`, allocating metadata
     /// upload memory via `alloc_scratch` (must remain alive until GPU completion).
+    /// If upload scratch, descriptor heap, or `costs` allocation fails, falls
+    /// back to recording scalar `fallback` clamps so no queued `ExecuteIndirect`
+    /// argument slot is ever left uninitialized.
     #[allow(clippy::too_many_arguments)]
     fn flush_on(
         &mut self,
         device: &ID3D12Device,
         g: &GatherClamp,
+        fallback: Option<&Clamp>,
         cmd_list: &ID3D12GraphicsCommandList,
         budget_gpu: u64,
         budget_res: &ID3D12Resource,
-        mode7_barrier_after: bool,
+        budget_barrier_after: bool,
         alloc_scratch: impl FnOnce(u64) -> Option<(u64, *mut u8)>,
     ) -> Option<GatherFlushStats> {
         if self.pending.is_empty() {
@@ -1528,7 +1624,53 @@ impl GatherState {
         let groups_offset = items_bytes.next_multiple_of(16);
         let groups_bytes = (groups_raw.len() * 16) as u64;
         let total_scratch = groups_offset + groups_bytes;
-        let (scratch_gpu, scratch_cpu) = alloc_scratch(total_scratch)?;
+        let Some((scratch_gpu, scratch_cpu)) = alloc_scratch(total_scratch) else {
+            return fallback.map(|c| {
+                self.record_pending_scalar(
+                    c,
+                    cmd_list,
+                    &pending,
+                    srvs,
+                    uavs,
+                    budget_gpu,
+                    budget_res,
+                    budget_barrier_after,
+                )
+            });
+        };
+        let Some((heap, base)) = self.ensure_heap(device, num_srvs + num_uavs) else {
+            return fallback.map(|c| {
+                self.record_pending_scalar(
+                    c,
+                    cmd_list,
+                    &pending,
+                    srvs,
+                    uavs,
+                    budget_gpu,
+                    budget_res,
+                    budget_barrier_after,
+                )
+            });
+        };
+        let costs_res = if single_pass {
+            None
+        } else {
+            let Some(buf) = self.ensure_costs(device, total_items) else {
+                return fallback.map(|c| {
+                    self.record_pending_scalar(
+                        c,
+                        cmd_list,
+                        &pending,
+                        srvs,
+                        uavs,
+                        budget_gpu,
+                        budget_res,
+                        budget_barrier_after,
+                    )
+                });
+            };
+            Some(buf)
+        };
 
         // SAFETY: `scratch_cpu` points to `total_scratch` writable mapped bytes
         // in upload memory that outlive the command list's GPU execution.
@@ -1545,7 +1687,6 @@ impl GatherState {
             );
         }
 
-        let (heap, base) = self.ensure_heap(device, num_srvs + num_uavs)?;
         // SAFETY: live device, shader-visible descriptor heap, valid buffer resources.
         let (srv_gpu_handle, uav_gpu_handle) = unsafe {
             let inc = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
@@ -1596,10 +1737,6 @@ impl GatherState {
             (srv_gpu, uav_gpu)
         };
 
-        // Keep all SRV and UAV resources alive until `HostList::reset`.
-        self.kept_resources.extend(srvs.into_iter().map(|(r, _)| r));
-        self.kept_resources.extend(uavs.into_iter().map(|(r, _)| r));
-
         let constants = [num_groups, total_items];
         let mut dispatches = 0u32;
         let mut barriers = 0u32;
@@ -1618,16 +1755,27 @@ impl GatherState {
                 cmd_list.SetComputeRootDescriptorTable(5, uav_gpu_handle);
                 cmd_list.Dispatch(1, 1, 1);
                 dispatches += 1;
-                if mode7_barrier_after {
+                if budget_barrier_after {
                     cmd_list.ResourceBarrier(&[uav_barrier_on(budget_res)]);
                     barriers += 1;
                 }
             }
         } else {
-            let costs_res = self.ensure_costs(device, total_items)?;
+            let costs_res = costs_res.expect("two-pass costs buffer ensured above");
             // SAFETY: live device-local UAV buffer.
             let costs_gpu = unsafe { costs_res.GetGPUVirtualAddress() };
-            // SAFETY: open command list, live root signature/PSOs/heap/buffers.
+            // Order Pass 1 UAV writes to `costs_res`, `budget_res` (mesh
+            // diagnostics), and every destination chunk in `uavs` before Pass 2
+            // reads `costs`/`budget` and zeroes any over-budget destination slots.
+            let mut mid_barriers = Vec::with_capacity(2 + uavs.len());
+            mid_barriers.push(uav_barrier_on(&costs_res));
+            mid_barriers.push(uav_barrier_on(budget_res));
+            for (uav_res, _) in &uavs {
+                mid_barriers.push(uav_barrier_on(uav_res));
+            }
+            // SAFETY: open command list, live root signature/PSOs/heap/buffers;
+            // every borrowed COM pointer in `mid_barriers` stays live through
+            // `ResourceBarrier`.
             unsafe {
                 if self.costs_used {
                     cmd_list.ResourceBarrier(&[uav_barrier_on(&costs_res)]);
@@ -1645,18 +1793,22 @@ impl GatherState {
                 cmd_list.SetComputeRootDescriptorTable(6, uav_gpu_handle);
                 cmd_list.Dispatch(num_groups, 1, 1);
                 dispatches += 1;
-                cmd_list.ResourceBarrier(&[uav_barrier_on(&costs_res)]);
+                cmd_list.ResourceBarrier(&mid_barriers);
                 barriers += 1;
                 cmd_list.SetPipelineState(&g.pass2_pso);
                 cmd_list.Dispatch(1, 1, 1);
                 dispatches += 1;
-                if mode7_barrier_after {
+                if budget_barrier_after {
                     cmd_list.ResourceBarrier(&[uav_barrier_on(budget_res)]);
                     barriers += 1;
                 }
             }
             self.costs_used = true;
         }
+
+        // Keep all SRV and UAV resources alive until `HostList::reset`.
+        self.kept_resources.extend(srvs.into_iter().map(|(r, _)| r));
+        self.kept_resources.extend(uavs.into_iter().map(|(r, _)| r));
 
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
@@ -1675,32 +1827,43 @@ impl GatherState {
 /// Called by `HostList::clamp_end` before transitioning destination chunks to
 /// `INDIRECT_ARGUMENT`, and by `bound_before` before a non-gatherable clamp or
 /// batch capacity flush.
-pub(crate) fn flush_gather(clamps: &HostList, mode7_barrier_after: bool) {
+pub(crate) fn flush_gather(clamps: &HostList, budget_barrier_after: bool) {
     let mut state = clamps.gather_state().lock().unwrap_or_else(|e| e.into_inner());
     if state.is_empty() {
         return;
     }
-    let Some(h) = host() else {
-        state.pending.clear();
-        return;
-    };
-    let Some(g) = gather_clamp() else {
-        state.pending.clear();
-        return;
-    };
     let Some((budget_gpu, budget_res)) = clamps.budget_with_resource() else {
         state.pending.clear();
         return;
     };
-    let _ = state.flush_on(
-        &h.device,
-        g,
-        &clamps.list,
-        budget_gpu,
-        budget_res,
-        mode7_barrier_after,
-        |len| clamps.scratch(len),
-    );
+    if let (Some(h), Some(g)) = (host(), gather_clamp()) {
+        let _ = state.flush_on(
+            &h.device,
+            g,
+            clamp(),
+            &clamps.list,
+            budget_gpu,
+            budget_res,
+            budget_barrier_after,
+            |len| clamps.scratch(len),
+        );
+    } else if let Some(c) = clamp() {
+        let pending = std::mem::take(&mut state.pending);
+        let srvs = std::mem::take(&mut state.srvs);
+        state.srv_index.clear();
+        let uavs = std::mem::take(&mut state.uavs);
+        state.uav_index.clear();
+        let _ = state.record_pending_scalar(
+            c,
+            &clamps.list,
+            &pending,
+            srvs,
+            uavs,
+            budget_gpu,
+            budget_res,
+            budget_barrier_after,
+        );
+    }
 }
 
 /// How clamps of indirect draws are recorded: 0 each before its draw; 1 in
@@ -1748,38 +1911,43 @@ pub(crate) fn bound_before(
         if state.would_overflow(records, src, count.map(|(b, _)| b), &dst)
             && let (Some(h), Some(g)) = (host(), gather_clamp())
         {
+            // Always serialize `budget_res` across consecutive gather flushes
+            // (regardless of `hoist_mode()`) so the next flush's `b0` load
+            // observes this flush's `InterlockedMax` budget update.
             let _ = state.flush_on(
                 &h.device,
                 g,
+                clamp(),
                 &clamps.list,
                 budget,
                 budget_res,
-                hoist_mode() == 7,
+                true,
                 |len| clamps.scratch(len),
             );
         }
         if state.enqueue((src, src_offset), count, (&dst, at), (kind, stride, records), 0) {
             return Some((dst, at));
         }
-        // Fallback to scalar path below: flush any queued gathered items first
-        // so budget charging stays strictly ordered before this scalar dispatch.
+        // Fallback to scalar path below: always flush queued gathered items
+        // with a `budget_res` UAV barrier before this scalar dispatch.
         if !state.is_empty()
             && let (Some(h), Some(g)) = (host(), gather_clamp())
         {
             let _ = state.flush_on(
                 &h.device,
                 g,
+                clamp(),
                 &clamps.list,
                 budget,
                 budget_res,
-                hoist_mode() == 7,
+                true,
                 |len| clamps.scratch(len),
             );
         }
     } else {
-        // Flush any queued gathered clamps before recording a scalar clamp so
-        // Mode 7 budget order is strictly preserved across mixed batches.
-        flush_gather(clamps, hoist_mode() == 7);
+        // Flush any queued gathered clamps with a `budget_res` UAV barrier
+        // before recording a scalar clamp so budget updates never race.
+        flush_gather(clamps, true);
     }
 
     let c = clamp()?;
@@ -1823,9 +1991,10 @@ pub(crate) fn bound_before(
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
         l.SetComputeRootUnorderedAccessView(4, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        // Mode 7: order budget updates across consecutive clamps without a
-        // full-GPU global UAV drain (destination offsets are disjoint).
-        if hoist_mode() == 7 {
+        // Mode 7 (or whenever gather batching is enabled and a later gather
+        // flush on this list may load `budget[0]` once): order budget updates
+        // without a full-GPU global UAV drain (destination offsets are disjoint).
+        if hoist_mode() == 7 || gather_enabled() {
             l.ResourceBarrier(&[uav_barrier_on(budget_res)]);
         }
     }
@@ -4101,6 +4270,7 @@ void main() {
                 .flush_on(
                     &hw.device,
                     hw.gather,
+                    Some(hw.clamp),
                     &hw.list,
                     budget_gather_gpu,
                     &budget_gather,
@@ -4267,6 +4437,7 @@ void main() {
                 .flush_on(
                     &hw.device,
                     hw.gather,
+                    Some(hw.clamp),
                     &hw.list,
                     budget_g_gpu,
                     &budget_g,
@@ -4374,11 +4545,12 @@ void main() {
         for i in 0..4u64 {
             assert!(gs.enqueue((&src, i * 16), None, (&dst, i * 16), (2, 12, 1), 0));
         }
-        // Mid-list flush BEFORE a scalar clamp (mode7_barrier_after = true).
+        // Mid-list flush BEFORE a scalar clamp (budget_barrier_after = true).
         let s1 = gs
             .flush_on(
                 &hw.device,
                 hw.gather,
+                Some(hw.clamp),
                 &hw.list,
                 budget_gpu,
                 &budget,
@@ -4411,6 +4583,7 @@ void main() {
             .flush_on(
                 &hw.device,
                 hw.gather,
+                Some(hw.clamp),
                 &hw.list,
                 budget_gpu,
                 &budget,
@@ -4550,6 +4723,132 @@ void main() {
         clamps.clamp_end();
         clamps.close();
         host.execute(&[&clamps]);
+    }
+
+    /// Regression test for F5 (allocation-failure scalar fallback) and F2
+    /// (consecutive mid-list gather flushes accumulating exact `budget[0]`):
+    /// forces `alloc_scratch` to return `None` on Batch 1 (including single
+    /// records and a multi-record counted draw with active count < max), then
+    /// runs Batch 2 via normal gather-clamp with `budget_barrier_after = true`,
+    /// and verifies bit-exact output and total budget on the real GPU.
+    #[test]
+    fn hw_gather_alloc_failure_falls_back_to_scalar_bit_exact() {
+        let Some(mut hw) = HwGatherHarness::new() else {
+            return;
+        };
+        let (src, src_ptr, _) = hw.shared_buffer(4096);
+        let (cnt, cnt_ptr, _) = hw.shared_buffer(64);
+        let (budget, budget_ptr, budget_gpu) = hw.shared_buffer(256);
+        let dst = hw.default_uav(1024);
+        let (sentinel, sentinel_ptr, _) = hw.upload_buffer(1024);
+        // SAFETY: initializing test source, count, sentinel, and budget buffers.
+        unsafe {
+            std::slice::from_raw_parts_mut(sentinel_ptr.cast::<u32>(), 256).fill(0x5A5A_A5A5);
+            cnt_ptr.cast::<u32>().write_volatile(2); // count=2 out of max=4
+            for k in 0..3 {
+                budget_ptr.cast::<u32>().add(k).write_volatile(0);
+            }
+            let w = src_ptr.cast::<u32>();
+            // Call 0 (offset 0, DRAW stride 16, records=1): 100 verts * 3 insts = cost 300.
+            w.add(0).write_volatile(100);
+            w.add(1).write_volatile(3);
+            w.add(2).write_volatile(7);
+            w.add(3).write_volatile(9);
+            // Call 1 (offset 32, INDEXED stride 20, max=4, count=2):
+            //   rec 0: 50*2 = 100, rec 1: 60*2 = 120; rec 2 & 3 hold garbage (untouched).
+            for r in 0..4usize {
+                let base = 8 + r * 5;
+                if r < 2 {
+                    w.add(base).write_volatile(50 + r as u32 * 10);
+                    w.add(base + 1).write_volatile(2);
+                    w.add(base + 2).write_volatile(r as u32);
+                    w.add(base + 3).write_volatile(10 + r as u32);
+                    w.add(base + 4).write_volatile(20 + r as u32);
+                } else {
+                    w.add(base).write_volatile(0xFFFF_FFFF);
+                    w.add(base + 1).write_volatile(0xFFFF_FFFF);
+                    w.add(base + 2).write_volatile(0xDEAD_0000);
+                    w.add(base + 3).write_volatile(0);
+                    w.add(base + 4).write_volatile(0);
+                }
+            }
+            // Call 2 (offset 256, DRAW stride 16, records=1): 200 verts * 4 insts = cost 800.
+            w.add(64).write_volatile(200);
+            w.add(65).write_volatile(4);
+            w.add(66).write_volatile(11);
+            w.add(67).write_volatile(13);
+
+            hw.list.CopyBufferRegion(&dst, 0, &sentinel, 0, 1024);
+            hw.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+
+        let mut gs = GatherState::default();
+        assert!(gs.enqueue((&src, 0), None, (&dst, 0), (0, 16, 1), 0));
+        assert!(gs.enqueue((&src, 32), Some((&cnt, 0)), (&dst, 32), (1, 20, 4), 0));
+        // Force scratch allocation failure -> must fall back to scalar clamps, NOT drop!
+        let fb_stats = gs
+            .flush_on(
+                &hw.device,
+                hw.gather,
+                Some(hw.clamp),
+                &hw.list,
+                budget_gpu,
+                &budget,
+                true,
+                |_| None,
+            )
+            .expect("scalar fallback on alloc failure must succeed");
+        assert_eq!(fb_stats.items, 5);
+        assert_eq!(fb_stats.groups, 0);
+        assert_eq!(fb_stats.dispatches, 2);
+
+        // Second batch flushed normally via gather-clamp after the scalar fallback.
+        let (scratch, scratch_ptr, scratch_gpu) = hw.upload_buffer(16 << 10);
+        assert!(gs.enqueue((&src, 256), None, (&dst, 256), (0, 16, 1), 0));
+        let g_stats = gs
+            .flush_on(
+                &hw.device,
+                hw.gather,
+                Some(hw.clamp),
+                &hw.list,
+                budget_gpu,
+                &budget,
+                false,
+                |_| Some((scratch_gpu, scratch_ptr)),
+            )
+            .expect("second gather flush must succeed");
+        assert_eq!(g_stats.dispatches, 1);
+
+        // SAFETY: transition dst back to COMMON before readback.
+        unsafe {
+            hw.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        hw.submit_and_wait();
+        drop(scratch);
+
+        let words = hw.read_default_words(&dst, 1024);
+        assert_eq!(&words[0..4], &[100, 3, 7, 9]);
+        assert_eq!(&words[8..13], &[50, 2, 0, 10, 20]);
+        assert_eq!(&words[13..18], &[60, 2, 1, 11, 21]);
+        // Inactive tail slots (rec 2, 3 >= count 2) must stay untouched sentinel!
+        assert!(
+            words[18..28].iter().all(|&w| w == 0x5A5A_A5A5),
+            "scalar fallback overwrote inactive counted tail slots"
+        );
+        assert_eq!(&words[64..68], &[200, 4, 11, 13]);
+        // Total budget = 300 + 100 + 120 + 800 = 1320.
+        // SAFETY: reading completed budget word after fence.
+        let total_budget = unsafe { budget_ptr.cast::<u32>().read_volatile() };
+        assert_eq!(total_budget, 1320, "budget lost update across fallback + gather flush");
+        gs.reset();
     }
 
     /// Real-GPU benchmark comparing BEFORE (scalar Mode 7: 256 per-record
@@ -4698,6 +4997,7 @@ void main() {
                     .flush_on(
                         &hw.device,
                         hw.gather,
+                        Some(hw.clamp),
                         &hw.list,
                         budget_gpu,
                         &budget,
