@@ -1421,19 +1421,23 @@ pub(crate) fn room() -> bool {
     static LAST_RECLAIM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static RECLAIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     const RECLAIM_EVERY_MS: u64 = 250;
-    let now = crate::host::now_ms();
-    let last = LAST_RECLAIM.load(Relaxed);
-    if now >= last.saturating_add(RECLAIM_EVERY_MS)
-        && LAST_RECLAIM
-            .compare_exchange(last, now, Relaxed, Relaxed)
-            .is_ok()
-        && !RECLAIMING.swap(true, std::sync::atomic::Ordering::Acquire)
-    {
-        let (freed, _) = reclaim_unpinned_idle(1_000, 30);
-        let _ = crate::texture::trim_idle_under_pressure(1_000, 4);
-        RECLAIMING.store(false, std::sync::atomic::Ordering::Release);
-        if freed > 0 {
-            return check();
+    struct ResetGuard(&'static std::sync::atomic::AtomicBool);
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    if !RECLAIMING.swap(true, std::sync::atomic::Ordering::Acquire) {
+        let _guard = ResetGuard(&RECLAIMING);
+        let now = crate::host::now_ms();
+        let last = LAST_RECLAIM.load(Relaxed);
+        if now >= last.saturating_add(RECLAIM_EVERY_MS) {
+            LAST_RECLAIM.store(now, Relaxed);
+            let (freed, _) = reclaim_unpinned_idle(1_000, 30);
+            let (trimmed, _) = crate::texture::trim_idle_under_pressure(1_000, 4);
+            if freed > 0 || trimmed > 0 {
+                return check();
+            }
         }
     }
     false
@@ -1562,7 +1566,7 @@ fn eviction_plan(
     .max(min_free);
     let target_bytes = used.saturating_sub(goal).clamp(min_free, max_free);
     let (idle_ms, idle_frames) = if high_pressure {
-        (base_idle_ms.min(MIN_IDLE_MS).max(MIN_IDLE_MS), HIGH_IDLE_FRAMES)
+        (MIN_IDLE_MS, HIGH_IDLE_FRAMES)
     } else {
         (
             base_idle_ms.min(PREEMPT_IDLE_MS).max(MIN_IDLE_MS),
@@ -1824,43 +1828,59 @@ fn reclaim_unpinned_idle(idle_ms: u64, idle_frames: u64) -> (u64, u64) {
         return (0, 0);
     }
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
-    let all = textures();
-    for &at in all.iter() {
-        // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
-        let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
-            continue;
-        }
-        let gone = {
-            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
-            });
-            if idle {
-                // Under the lock: the next use must not find the staging
-                // state of the texture let go (it says "uploaded").
-                crate::texture::unstage(at as This);
-                made.take()
-            } else {
-                None
+    let mut retired_hosts: Vec<std::sync::Arc<HostTexture>> = Vec::new();
+    let mut retired_staging: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
+    {
+        let all = textures();
+        for &at in all.iter() {
+            // SAFETY: a texture leaves the table before it is freed, under the
+            // lock held here (`Drop for Resource`).
+            let r = unsafe { &*(at as *const Resource) };
+            if !fills(&r.desc) || crate::texture::host_wrote(at) {
+                continue;
             }
-        };
-        if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
-            went += 1;
-            bytes += host.bytes;
-            if first.is_none() {
-                first = Some(at);
+            let (gone, staged) = {
+                let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                let idle = made.as_ref().is_some_and(|(host, _)| {
+                    crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
+                        && std::sync::Arc::strong_count(host) == 1
+                        && crate::host::references(&host.texture) == 1
+                });
+                if idle {
+                    // Under the lock: the next use must not find the staging
+                    // state of the texture let go (it says "uploaded"), while
+                    // COM destruction is deferred until all locks are dropped.
+                    let staged = crate::texture::take_staged(at as This);
+                    (made.take(), staged)
+                } else {
+                    (None, None)
+                }
+            };
+            if let Some(s) = staged {
+                retired_staging.push(s);
             }
-            crate::host::retire(host);
+            if let Some((host, _)) = gone {
+                r.host.gone.store(true, Relaxed);
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+                went += 1;
+                bytes += host.bytes;
+                if first.is_none() {
+                    first = Some(at);
+                }
+                retired_hosts.push(host);
+            }
         }
     }
-    drop(all);
+    // Retire COM upload buffers and host textures only after dropping `made`,
+    // `STAGING`, and `TEXTURES` so synchronous `ID3D12Resource::Release()`
+    // never executes while any lock is held.
+    for s in retired_staging {
+        crate::host::retire(s);
+    }
+    for host in retired_hosts {
+        crate::host::retire(host);
+    }
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -1885,17 +1905,15 @@ pub(crate) fn let_go_idle() {
     // Align idle acceleration to `room_percent()` as well as fixed DXGI tiers
     // so lower `VICTORY_TEXTURE_ROOM_PERCENT` values (e.g. 60%) do not stall
     // behind a 5,000 ms timeout while above their configured ceiling.
+    // (`texture::let_go_idle` runs right before this in `sweep()` and already
+    // performs pressure-driven staging trimming.)
     let effective_idle_ms = match pressure {
-        2 => base_idle_ms.min(1_000).max(1_000),
+        2 => 1_000,
         1 => base_idle_ms.min(2_500).max(1_000),
         _ => base_idle_ms,
     };
     let _ = reclaim_unpinned_idle(effective_idle_ms, IDLE_FRAMES);
     evict_under_vram_pressure(video, effective_idle_ms);
-    if pressure >= 1 {
-        let trim_ms = if pressure >= 2 { 1_000 } else { 2_000 };
-        let _ = crate::texture::trim_idle_under_pressure(trim_ms, 4);
-    }
 }
 
 /// When VRAM usage reaches the eviction trigger aligned to [`room_percent`]
@@ -1914,15 +1932,18 @@ fn evict_under_vram_pressure(video: Option<[u64; 4]>, base_idle_ms: u64) {
     }
     let room_pct = room_percent();
     let trigger_pct = evict_trigger_percent(room_pct);
-    let plan = video
-        .and_then(|[budget, used, ..]| {
-            eviction_plan(budget, used, room_pct, trigger_pct, base_idle_ms)
-                .map(|p| (p, budget, used))
-        })
-        .or_else(|| {
-            let limit = texture_budget_limit()?;
+    // Match `room()` and `vram_pressure_level()` precedence: check an explicit
+    // `VICTORY_TEXTURE_BUDGET_MB` cap first so hitting it runs high-pressure
+    // eviction rather than being masked by a lower DXGI percentage band.
+    let plan = texture_budget_limit()
+        .and_then(|limit| {
             let filled = KINDS[1].load(Relaxed);
             eviction_plan(limit, filled, 100, 98, base_idle_ms).map(|p| (p, limit, filled))
+        })
+        .or_else(|| {
+            let [budget, used, ..] = video?;
+            eviction_plan(budget, used, room_pct, trigger_pct, base_idle_ms)
+                .map(|p| (p, budget, used))
         });
     let Some((plan, budget, used)) = plan else {
         return;
@@ -2012,8 +2033,12 @@ fn evict_lru_textures_at(plan: EvictionPlan, now: u64) -> (u64, u64, u64) {
     }
 
     // Pass 2: now that descriptor heaps released their COM references (and no
-    // submission is in flight), free every victim whose refcount dropped to 1.
+    // submission is in flight), free every victim whose refcount dropped to 1,
+    // retiring all COM objects only after dropping `made`, `STAGING`, and
+    // `TEXTURES`.
     let (mut freed, mut freed_bytes) = (0u64, 0u64);
+    let mut retired_hosts: Vec<std::sync::Arc<HostTexture>> = Vec::new();
+    let mut retired_staging: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
     {
         let all = textures();
         for at in victim_resources {
@@ -2022,28 +2047,37 @@ fn evict_lru_textures_at(plan: EvictionPlan, now: u64) -> (u64, u64, u64) {
             }
             // SAFETY: `at` is still live in `TEXTURES` under the lock.
             let r = unsafe { &*(at as *const Resource) };
-            let gone = {
+            let (gone, staged) = {
                 let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
                 let ready = made.as_ref().is_some_and(|(host, _)| {
                     std::sync::Arc::strong_count(host) == 1
                         && crate::host::references(&host.texture) == 1
                 });
                 if ready {
-                    crate::texture::unstage(at as This);
-                    made.take()
+                    let staged = crate::texture::take_staged(at as This);
+                    (made.take(), staged)
                 } else {
-                    None
+                    (None, None)
                 }
             };
+            if let Some(s) = staged {
+                retired_staging.push(s);
+            }
             if let Some((host, _)) = gone {
                 r.host.gone.store(true, Relaxed);
                 KINDS[2].fetch_add(1, Relaxed);
                 KINDS[3].fetch_add(host.bytes, Relaxed);
                 freed += 1;
                 freed_bytes += host.bytes;
-                crate::host::retire(host);
+                retired_hosts.push(host);
             }
         }
+    }
+    for s in retired_staging {
+        crate::host::retire(s);
+    }
+    for host in retired_hosts {
+        crate::host::retire(host);
     }
     (freed, freed_bytes, slots_cleared)
 }
