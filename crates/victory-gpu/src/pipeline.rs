@@ -236,7 +236,10 @@ fn image_stores(program: &victory_shader::NativeProgram) -> bool {
 /// the programs that walk them translate.
 #[cfg(windows)]
 struct Builder {
-    pipelines: Vec<Arc<make::Pending>>,
+    /// `(shader_hash, pending_pipeline)` deduplicated by shader hash.
+    pipelines: Vec<(String, Arc<make::Pending>)>,
+    /// Number of leading entries in `pipelines` already verified ready.
+    verified: usize,
     /// Every one of `pipelines` has a host pipeline.
     whole: bool,
     /// One could not be made.
@@ -246,6 +249,7 @@ struct Builder {
 #[cfg(windows)]
 static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     pipelines: Vec::new(),
+    verified: 0,
     whole: false,
     off: false,
 });
@@ -266,6 +270,13 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
 
+/// Whether `VICTORY_BVH_QUARANTINE=1` is enabled for this run.
+#[cfg(windows)]
+pub(crate) fn quarantine_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+}
+
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
 /// stays in the host's copies and is not copied back into title memory. A
 /// check for a first run of the whole builder: a stage that stores where
@@ -276,8 +287,7 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// memory when the title writes them.
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    is_builder(this) && quarantine_enabled()
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -296,6 +306,45 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
+/// Verifies every pending builder stage without holding [`BUILDER`] during
+/// shader translation / driver pipeline creation (avoiding blocking other
+/// recording threads or `CreateComputePipelineState` callers), using up to
+/// four parallel threads when multiple stages need compilation.
+#[cfg(windows)]
+fn verify_builder_batch(batch: &[(String, Arc<make::Pending>)]) -> Vec<String> {
+    if batch.len() <= 1 {
+        return batch
+            .iter()
+            .filter(|(_, p)| !make::now(p))
+            .map(|(h, _)| h.clone())
+            .collect();
+    }
+    let workers = batch.len().min(4);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed = Mutex::new(Vec::<String>::new());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((hash, pending)) = batch.get(i) else {
+                        break;
+                    };
+                    if !make::now(pending) {
+                        failed
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(hash.clone());
+                    }
+                }
+            });
+        }
+    });
+    let mut failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
+    failed.sort_unstable();
+    failed
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
@@ -304,29 +353,42 @@ pub(crate) fn builder_runs() -> bool {
     if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
         return false;
     }
-    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.off {
-        return false;
+    loop {
+        let (batch, target_len) = {
+            let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+            if b.off {
+                return false;
+            }
+            if b.whole {
+                return true;
+            }
+            (b.pipelines[b.verified..].to_vec(), b.pipelines.len())
+        };
+        let failed = verify_builder_batch(&batch);
+        let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+        if b.off {
+            return false;
+        }
+        if !failed.is_empty() {
+            b.off = true;
+            tracing::warn!(
+                missing = failed.len(),
+                of = b.pipelines.len(),
+                ?failed,
+                "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
+            );
+            return false;
+        }
+        b.verified = b.verified.max(target_len);
+        if b.verified == b.pipelines.len() {
+            tracing::info!(
+                pipelines = b.pipelines.len(),
+                "the ray-tracing structure builder runs: all of its programs have host pipelines"
+            );
+            b.whole = true;
+            return true;
+        }
     }
-    if b.whole {
-        return true;
-    }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
-    if missing > 0 {
-        b.off = true;
-        tracing::warn!(
-            missing,
-            of = b.pipelines.len(),
-            "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
-        );
-        return false;
-    }
-    tracing::info!(
-        pipelines = b.pipelines.len(),
-        "the ray-tracing structure builder runs: all of its programs have host pipelines"
-    );
-    b.whole = true;
-    true
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -519,17 +581,27 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
-    #[cfg(windows)]
-    make::early(&host);
-    #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
-    if builder {
-        // Another stage: the group is looked at again at its next dispatch.
+    let (host, fresh_host) = if builder {
+        // Deduplicate by compute shader hash by sharing the same `Pending`
+        // handle so duplicate creates cannot skip `builder_runs()` verification.
+        let hash = shaders[0].hash.clone();
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-        b.pipelines.push(host.clone());
-        b.whole = false;
+        if let Some((_, existing)) = b.pipelines.iter().find(|(h, _)| h == &hash) {
+            (existing.clone(), false)
+        } else {
+            let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+            b.pipelines.push((hash, host.clone()));
+            b.whole = false;
+            (host, true)
+        }
+    } else {
+        (Arc::new(make::Pending::new(shaders.clone(), graphics)), true)
+    };
+    #[cfg(windows)]
+    if fresh_host {
+        make::early(&host);
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
@@ -871,6 +943,26 @@ mod tests {
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
                 (1, 28)
             );
+        }
+    }
+
+    #[test]
+    fn builder_batch_verifies_in_parallel_and_reports_sorted_failures() {
+        #[cfg(windows)]
+        {
+            let mk = |bytes: &[u8]| {
+                let s = shader("compute", bytes);
+                let hash = s.hash.clone();
+                let pending = Arc::new(make::Pending::new(vec![s], None));
+                (hash, pending)
+            };
+            let a = mk(b"not-a-valid-builder-shader-a");
+            let b = mk(b"not-a-valid-builder-shader-b");
+            let c = mk(b"not-a-valid-builder-shader-c");
+            let mut expected = vec![a.0.clone(), b.0.clone(), c.0.clone()];
+            expected.sort_unstable();
+            let got = verify_builder_batch(&[a, b, c]);
+            assert_eq!(got, expected);
         }
     }
 }

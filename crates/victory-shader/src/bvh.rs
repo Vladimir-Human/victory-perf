@@ -370,6 +370,30 @@ pub(crate) mod tests {
         );
         // A base past 4 GiB of 256-byte units.
         assert_eq!(node_address(0, 0x8000_0001, 8), (1 << 40) + 64);
+        // 32-bit split address arithmetic (used by `emit/intersect.rs` to
+        // avoid `flags::INT64`) matches 64-bit `node_address` across carry
+        // boundaries, high pointers, and descriptor flags.
+        let split_addr = |word0: u32, word1: u32, ptr_lo: u32, ptr_hi: u32| -> u64 {
+            let p_lo = (ptr_lo & !7) << 3;
+            let p_hi = (ptr_lo >> 29) | (ptr_hi << 3);
+            let base_lo = word0 << 8;
+            let base_hi = (word0 >> 24) | ((word1 & 0xff) << 8);
+            let low = base_lo.wrapping_add(p_lo);
+            let carry = u32::from(low < base_lo);
+            let high = base_hi.wrapping_add(p_hi).wrapping_add(carry);
+            u64::from(low) | (u64::from(high) << 32)
+        };
+        for (word0, word1, ptr) in [
+            (0u32, BOX_SORT, 0x12_3456_7800u64 >> 3 | 5),
+            (0x00ff_ffff, BOX_SORT | 0xab, 0xffff_fff8u64 | 4),
+            (0xffff_ffff, 0xffff_ff01, 0x0000_0000_ffff_fffe),
+            (0x8000_0000, 0x7fff_ff00, 0x0000_00ff_e000_000d),
+            (0x1234_5678, BOX_SORT | 0x34, 0x0000_0007_89ab_cdef),
+        ] {
+            let expected = node_address(word0, word1, ptr);
+            let got = split_addr(word0, word1, ptr as u32, (ptr >> 32) as u32);
+            assert_eq!(got, expected, "{word0:#x} {word1:#x} {ptr:#x}");
+        }
     }
 
     #[test]

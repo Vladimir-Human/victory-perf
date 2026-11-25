@@ -169,8 +169,17 @@ pub enum BvhNodes {
     Resource,
     /// Title memory by address: the code makes the descriptor from numbers
     /// (the title: the whole address space, or one structure's address in
-    /// dword 0). Dwords 1 and 3, which hold its flags.
-    Memory { word1: u32, word3: u32 },
+    /// dword 0 and the low byte of dword 1).
+    Memory {
+        /// Whether descriptor dword 1 enables box sorting (bit 31): statically
+        /// known when `Some`, or tested from dword 1 at runtime when `None`.
+        sort: Option<bool>,
+        /// Whether the descriptor base address (dword 0 and low byte of dword 1)
+        /// is statically known to be zero.
+        zero_base: bool,
+        /// Descriptor dword 3 (type and triangle return mode).
+        word3: u32,
+    },
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -266,10 +275,20 @@ pub fn track(
                         _ => None,
                     };
                     match (word(1), word(3)) {
-                        (Some(Term::Const(word1)), Some(Term::Const(word3)))
+                        (Some(w1), Some(Term::Const(word3)))
                             if word3 >> 28 == crate::bvh::DESCRIPTOR_TYPE =>
                         {
-                            out.bvh.push((site, BvhNodes::Memory { word1, word3 }));
+                            let sort = t.bvh_sort(w1);
+                            let zero_base = matches!(word(0), Some(Term::Const(0)))
+                                && matches!(w1, Term::Const(c) if c & 0xff == 0);
+                            out.bvh.push((
+                                site,
+                                BvhNodes::Memory {
+                                    sort,
+                                    zero_base,
+                                    word3,
+                                },
+                            ));
                         }
                         _ => {
                             descriptor(rsrc, Role::Resource)?;
@@ -598,6 +617,39 @@ impl<'a> Tracer<'a> {
                 self.term(inst, src.get(1)?)?,
             ],
         ))
+    }
+
+    /// Whether BVH descriptor dword 1 (`t`) statically determines bit 31
+    /// (`BOX_SORT`), or `None` when it must be tested at runtime.
+    fn bvh_sort(&self, t: Term) -> Option<bool> {
+        match t {
+            Term::Const(c) => Some(c & crate::bvh::BOX_SORT != 0),
+            Term::Value(v) => {
+                if let Some((_, [a, b])) = self.sop2(v, &["s_or_b32"])
+                    && (matches!(a, Term::Const(c) if c & crate::bvh::BOX_SORT != 0)
+                        || matches!(b, Term::Const(c) if c & crate::bvh::BOX_SORT != 0))
+                {
+                    return Some(true);
+                }
+                if let Some((_, [a, b])) = self.sop2(v, &["s_and_b32"])
+                    && (matches!(a, Term::Const(c) if c & crate::bvh::BOX_SORT == 0)
+                        || matches!(b, Term::Const(c) if c & crate::bvh::BOX_SORT == 0))
+                {
+                    return Some(false);
+                }
+                if let Some((_, [_, Term::Const(shift)])) = self.sop2(v, &["s_lshr_b32"])
+                    && (shift & 31) > 0
+                {
+                    return Some(false);
+                }
+                if let Some((_, [_, Term::Const(spec)])) = self.sop2(v, &["s_bfe_u32"])
+                    && ((spec >> 16) & 0x7f) < 32
+                {
+                    return Some(false);
+                }
+                None
+            }
+        }
     }
 
     fn root_indexed_view(
