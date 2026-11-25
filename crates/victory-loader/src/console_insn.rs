@@ -66,6 +66,12 @@ pub(crate) fn emulated_count() -> u64 {
     THREAD_EMULATED.with(Cell::get)
 }
 
+#[cfg(test)]
+fn clear_thread_caches() {
+    WRITABLE.with(|w| w.set(([(0, 0); 4], 0)));
+    CODE.with(|c| c.set([(0, 0); 8]));
+}
+
 /// The general-purpose register numbered `n` in ModRM/REX encoding (`0..=15`).
 pub(crate) fn gpr(ctx: &mut CONTEXT, n: u8) -> &mut u64 {
     match n & 15 {
@@ -627,6 +633,7 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: `self.ptr` was allocated with `VirtualAlloc`.
             unsafe { VirtualFree(self.ptr.cast(), 0, MEM_RELEASE) };
+            clear_thread_caches();
         }
     }
 
@@ -642,6 +649,7 @@ mod tests {
 
     #[test]
     fn wait_loop_patches_on_first_fault_and_takes_zero_exceptions_after() {
+        clear_thread_caches();
         crate::report_crashes();
         // loop(rcx = iters):
         //   monitorx          (0F 01 FA)
@@ -683,6 +691,7 @@ mod tests {
 
     #[test]
     fn prefixed_monitorx_and_mwaitx_patch_and_execute_as_nops() {
+        clear_thread_caches();
         crate::report_crashes();
         // Prefix combinations before 0F 01 FA / 0F 01 FB, preserving rax/rbx/rcx/rdx/flags:
         //   67 0F 01 FA ; 48 0F 01 FB ; 66 0F 01 FA ; F2 0F 01 FB ; F3 0F 01 FA ; ret
@@ -731,6 +740,7 @@ mod tests {
 
     #[test]
     fn concurrent_threads_patching_same_wait_site_do_not_race() {
+        clear_thread_caches();
         crate::report_crashes();
         let code = [0x0F, 0x01, 0xFA, 0x0F, 0x01, 0xFB, 0x48, 0xFF, 0xC9, 0x75, 0xF5, 0xC3];
         let buf = Arc::new(ExecBuf::new(&code));
@@ -782,6 +792,7 @@ mod tests {
 
     #[test]
     fn clzero_loop_variants_execute_and_set_exact_flags() {
+        clear_thread_caches();
         crate::report_crashes();
         // Test via real PAGE_EXECUTE_READ machine code + VEH on this CPU:
         // 1) Non-rax induction (15-byte): clzero; add r8, 0x40; mov rax, r8; cmp r8, r9; jb -15; ret
@@ -854,6 +865,7 @@ mod tests {
 
     #[test]
     fn clzero_loop_partially_writable_range_stops_at_unwritable_page() {
+        clear_thread_caches();
         // Two adjacent pages: page 0 is PAGE_READWRITE, page 1 is PAGE_READONLY.
         // SAFETY: allocates 2 pages with distinct protections and frees them before returning.
         unsafe {
@@ -882,6 +894,7 @@ mod tests {
             assert_eq!(ctx.Rax, base.add(0x1000) as u64);
 
             VirtualFree(base.cast(), 0, MEM_RELEASE);
+            clear_thread_caches();
         }
     }
 
@@ -889,7 +902,8 @@ mod tests {
     fn opt_out_patch_wait_zero_leaves_code_unpatched() {
         const ITERS: u64 = 100;
         if std::env::var_os("VICTORY_OPTOUT_CHILD").is_some() {
-            crate::report_crashes();
+            clear_thread_caches();
+        crate::report_crashes();
             let code = [0x0F, 0x01, 0xFA, 0x0F, 0x01, 0xFB, 0x48, 0xFF, 0xC9, 0x75, 0xF5, 0xC3];
             let buf = ExecBuf::new(&code);
             let before = emulated_count();
@@ -967,6 +981,8 @@ mod tests {
 
     #[test]
     fn straddling_wait_and_clzero_loop_across_distinct_page_protections() {
+        clear_thread_caches();
+        clear_thread_caches();
         crate::report_crashes();
         // Two adjacent executable pages with distinct protections: PAGE_EXECUTE_READ + PAGE_EXECUTE_READWRITE.
         // SAFETY: allocates 2 pages with VirtualAlloc and frees them at the end.
@@ -1066,6 +1082,7 @@ mod tests {
             assert!(target.0.iter().all(|&b| b == 0));
 
             VirtualFree(base.cast(), 0, MEM_RELEASE);
+            clear_thread_caches();
         }
     }
 
@@ -1101,6 +1118,7 @@ mod tests {
             0
         }
 
+        clear_thread_caches();
         crate::report_crashes();
         // SAFETY: allocates 2 pages for this test, registers scoped first-chance VEH, and cleans up.
         unsafe {
@@ -1141,6 +1159,7 @@ mod tests {
             // 3) ClzeroLoop starting directly on guarded PAGE_READONLY page 0
             std::ptr::write_bytes(base, 0xCC, 0x1000);
             assert_ne!(VirtualProtect(base.cast(), 0x1000, PAGE_READONLY, &mut old), 0);
+            clear_thread_caches();
             f(base, base.add(0x1000));
             assert_eq!(WATCH_OPENED.load(Ordering::Relaxed), 3);
             assert!(std::slice::from_raw_parts(base, 0x1000).iter().all(|&b| b == 0));
@@ -1148,6 +1167,7 @@ mod tests {
             RemoveVectoredExceptionHandler(veh);
             WATCH_BASE.store(0, Ordering::Release);
             VirtualFree(base.cast(), 0, MEM_RELEASE);
+            clear_thread_caches();
         }
     }
 
@@ -1186,6 +1206,8 @@ mod tests {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_COPY, MapViewOfFile, PAGE_GUARD, UnmapViewOfFile};
 
+        clear_thread_caches();
+
         // 1) `PAGE_WRITECOPY` mapped section view must allow `clzero` and `ClzeroLoop`.
         // SAFETY: creates an anonymous 1-page section, maps a copy-on-write view, and unmaps/closes it.
         unsafe {
@@ -1214,6 +1236,7 @@ mod tests {
 
             UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view.cast() });
             CloseHandle(map);
+            clear_thread_caches();
         }
 
         // 2) `PAGE_READWRITE | PAGE_GUARD` must be refused and never cached in `WRITABLE`.
@@ -1228,6 +1251,7 @@ mod tests {
             assert_eq!(emulate_slice(&mut ctx, &clzero), None);
             assert_eq!(emulate_slice(&mut ctx, &clzero), None, "guard page must not be cached in WRITABLE");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
+            clear_thread_caches();
         }
 
         // 3) Overflow addresses near `u64::MAX` must fail cleanly without panicking.
@@ -1252,6 +1276,7 @@ mod tests {
             return;
         }
         if let Ok(mode) = std::env::var("VICTORY_BENCH_CHILD") {
+            clear_thread_caches();
             crate::report_crashes();
             let code = [0x0F, 0x01, 0xFA, 0x0F, 0x01, 0xFB, 0x48, 0xFF, 0xC9, 0x75, 0xF5, 0xC3];
             let buf = ExecBuf::new(&code);
