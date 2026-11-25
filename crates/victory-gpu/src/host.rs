@@ -1942,6 +1942,11 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// Title textures of the kinds copied back ([`crate::texback`]) that
+    /// the list's shaders write, copied when the list closes.
+    back_wanted: Vec<usize>,
+    /// Those copies, whose texels go to title memory once the list has run.
+    texture_backs: Vec<crate::texback::Back>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -1973,6 +1978,8 @@ impl Deferred {
         self.textures.clear();
         self.writes.clear();
         self.backs.clear();
+        self.back_wanted.clear();
+        self.texture_backs.clear();
         self.budget_zeroed = false;
     }
 }
@@ -3097,6 +3104,10 @@ fn read_backs(list: &HostList) {
                 buffer.Unmap(0, None);
             }
         }
+    }
+    // Textures shaders wrote that the title reads on the CPU ([`crate::texback`]).
+    for back in &list.deferred().texture_backs {
+        crate::texback::land(back);
     }
 }
 
@@ -5237,6 +5248,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        self.textures_back();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -5784,7 +5796,9 @@ impl HostList {
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
-                && deferred.backs.is_empty())
+                && deferred.backs.is_empty()
+                && deferred.back_wanted.is_empty()
+                && deferred.texture_backs.is_empty())
             {
                 return false;
             }
@@ -5924,6 +5938,36 @@ impl HostList {
     /// the list is reset.
     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    }
+
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`]), the list copies it when it closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred.back_wanted.contains(&(resource as usize)) {
+            deferred.back_wanted.push(resource as usize);
+        }
+    }
+
+    /// Before the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers ([`crate::texback::record`]).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for resource in wanted {
+            let resource = resource as crate::object::This;
+            crate::list::ensure_state(self, resource, COPY_SOURCE);
+            let Some(copy) = crate::resource::host_copy(resource) else {
+                continue;
+            };
+            if let Some(back) = crate::texback::record(&self.list, resource, &copy.texture) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
