@@ -1373,7 +1373,15 @@ impl HostHeap {
             {
                 (false, None)
             } else {
-                (true, self.unmake_in_stripe(index, &mut stripe))
+                let old = self.unmake_in_stripe(index, &mut stripe);
+                {
+                    let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                    textures.rechecks.remove(&index);
+                    if !textures.slots.contains_key(&index) {
+                        self.clear_flag(index, FLAG_TEXTURES);
+                    }
+                }
+                (true, old)
             }
         };
         if !was_made {
@@ -1381,13 +1389,6 @@ impl HostHeap {
         }
         if let Some(old) = old {
             crate::host::retire(old);
-        }
-        {
-            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            textures.rechecks.remove(&index);
-            if !textures.slots.contains_key(&index) {
-                self.clear_flag(index, FLAG_TEXTURES);
-            }
         }
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
@@ -1663,9 +1664,16 @@ impl HostHeap {
             }
             _ => false,
         };
-        if texture || !stale.is_empty() || (flags & FLAG_TEXTURES != 0) {
+        // Re-load FLAG_TEXTURES after dropping `placed` so concurrent
+        // `texture_slots_remapped` / `texture_slot_recheck` / `sweep_part`
+        // insertions that completed since entry are never missed.
+        let textures_flagged = self
+            .slot_flags
+            .get(index as usize)
+            .is_none_or(|f| f.load(std::sync::atomic::Ordering::Acquire) & FLAG_TEXTURES != 0);
+        if texture || !stale.is_empty() || textures_flagged {
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            if texture || (flags & FLAG_TEXTURES != 0) {
+            if texture || textures_flagged {
                 self.update_texture_queue(&mut textures, index, texture, seen, frame);
             }
             if !stale.is_empty() {
@@ -3804,7 +3812,7 @@ mod tests {
 
     #[test]
     fn contested_same_slot_updates_and_eviction_stay_consistent() {
-        use std::sync::atomic::Ordering::Acquire;
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
         let Some(gpu) = host() else {
             return; // no host GPU
         };
@@ -3819,14 +3827,27 @@ mod tests {
         crate::shadow::register(resource_id, aligned_base, 64 * 256);
         assert!(crate::shadow::find(aligned_base, 256).is_some());
 
+        let tex_desc = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0];
+        let victim_addr = 0x7d_7500_0000u64;
+        let victim_tex = crate::resource::texture_at(victim_addr, &tex_desc).expect("victim texture");
+        let victim_res = crate::resource::host_resource(victim_tex).expect("victim host resource");
+        let victim_raw = windows::core::Interface::as_raw(victim_res) as usize;
+        let mut victims = std::collections::HashSet::new();
+        victims.insert(victim_raw);
+        let srv_desc = [28, 4, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 0, 0, 1, 0, 0, 0, 0];
+
         let mut variant_handles = vec![[0u32; 8]; THREADS * CONTESTED_SLOTS];
         let vbase = variant_handles.as_mut_ptr() as u64;
         for tid in 0..THREADS {
             for s in 0..CONTESTED_SLOTS {
                 let slot = tid * CONTESTED_SLOTS + s;
                 let handle = vbase + (slot as u64) * 32;
-                let addr = aligned_base + (((tid + s) & 63) as u64) * 256;
-                super::super::record(handle, View::Constant(addr, 256));
+                if (tid + s) % 2 == 0 {
+                    super::super::record(handle, View::Shader(victim_tex as usize, Some(srv_desc)));
+                } else {
+                    let addr = aligned_base + (((tid + s) & 63) as u64) * 256;
+                    super::super::record(handle, View::Constant(addr, 256));
+                }
             }
         }
 
@@ -3835,11 +3856,20 @@ mod tests {
         ];
         let heap = HostHeap::new(false, HEAP_SLOTS as u32).expect("host heap");
         let _ = gpu.log_messages(); // clear one-time probe_view_limit() message if this test ran first
+
+        // Seed half of the contested slots with the victim texture before starting.
+        for &slot in &targets[..CONTESTED_SLOTS / 2] {
+            assert!(heap.mirror(slot, vbase, true).is_some());
+        }
+
+        let evicted_total = std::sync::atomic::AtomicU64::new(0);
         let barrier = std::sync::Barrier::new(THREADS);
         std::thread::scope(|s| {
             for tid in 0..THREADS {
                 let heap = &heap;
                 let barrier = &barrier;
+                let victims = &victims;
+                let evicted_total = &evicted_total;
                 s.spawn(move || {
                     barrier.wait();
                     for round in 0..300 {
@@ -3849,8 +3879,7 @@ mod tests {
                         if round % 17 == 0 && tid == 0 {
                             let _ = heap.texture_slot_gone(target_slot);
                         } else if round % 29 == 0 && tid == 1 {
-                            let victims = std::collections::HashSet::new();
-                            let _ = heap.evict_kept(&victims);
+                            evicted_total.fetch_add(heap.evict_kept(victims), Relaxed);
                         } else {
                             assert!(heap.mirror(target_slot, handle, true).is_some());
                         }
@@ -3858,6 +3887,10 @@ mod tests {
                 });
             }
         });
+        assert!(
+            evicted_total.load(Acquire) > 0,
+            "evict_kept must actually evict real victim slots under concurrent mirror()"
+        );
 
         // Finalize every contested slot cleanly and verify consistency.
         for (i, &slot) in targets.iter().enumerate() {
@@ -3867,11 +3900,27 @@ mod tests {
             assert!(heap.has_kept(slot));
         }
 
+        // Verify post-storm `evict_kept` clears victim slots cleanly (`made == 0` & `!has_kept`).
+        let mut victim_slots = Vec::new();
+        for (i, &slot) in targets.iter().enumerate() {
+            if i % 2 == 0 {
+                let handle = vbase + (i as u64) * 32;
+                assert!(heap.mirror(slot, handle, true).is_some());
+                victim_slots.push(slot);
+            }
+        }
+        assert_eq!(heap.evict_kept(&victims), victim_slots.len() as u64);
+        for slot in victim_slots {
+            assert_eq!(heap.made[slot as usize].load(Acquire), 0);
+            assert!(!heap.has_kept(slot));
+        }
+
         // SAFETY: plain device query.
         assert!(unsafe { gpu.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(gpu.log_messages(), None);
 
         crate::shadow::unregister(resource_id, aligned_base);
+        super::super::forget(victim_tex as usize);
         let _ = backing;
     }
 
