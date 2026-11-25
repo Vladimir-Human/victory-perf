@@ -179,13 +179,19 @@ fn is_committed_readonly(va: usize) -> bool {
 }
 
 fn writable(va: usize, bytes: usize) -> bool {
-    writable_to(va, va + bytes) == Some(va + bytes)
+    let Some(end) = va.checked_add(bytes) else {
+        return false;
+    };
+    writable_to(va, end) == Some(end)
 }
 
 /// Where the committed, writable memory that `va` lies in ends, at most `end`; None if `va`
 /// is not in such memory. A region found is remembered ([`remembers`]).
 fn writable_to(va: usize, end: usize) -> Option<usize> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE,
+        PAGE_WRITECOPY, VirtualQuery,
+    };
     let remember = remembers();
     if remember {
         let (regions, answers) = WRITABLE.with(Cell::get);
@@ -200,7 +206,8 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     // SAFETY: a valid out pointer of the right size.
     let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
     ASKED.fetch_add(1, Ordering::Relaxed);
-    if !found || m.State != MEM_COMMIT || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 {
+    let prot_ok = matches!(m.Protect & 0xFF, PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY);
+    if !found || m.State != MEM_COMMIT || m.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 || !prot_ok {
         return None;
     }
     let (from, to) = (m.BaseAddress as usize, m.BaseAddress as usize + m.RegionSize);
@@ -478,7 +485,9 @@ unsafe fn apply_emulation(ctx: &mut CONTEXT, code: &[u8], what: ConsoleOnly, len
                 let Some(last_line) = (ctx.Rax as usize).checked_add((outcome.iters as usize - 1) * 64) else {
                     return 0;
                 };
-                let zero_end = (last_line & !63) + 64;
+                let Some(zero_end) = (last_line & !63).checked_add(64) else {
+                    return 0;
+                };
                 let mut at = zero_start;
                 while at < zero_end {
                     let Some(to) = writable_to(at, zero_end) else { break };
@@ -621,6 +630,16 @@ mod tests {
         }
     }
 
+    fn cpu_has_monitorx() -> bool {
+        let max_ext = std::arch::x86_64::__cpuid(0x8000_0000).eax;
+        max_ext >= 0x8000_0001 && (std::arch::x86_64::__cpuid(0x8000_0001).ecx & (1 << 29)) != 0
+    }
+
+    fn cpu_has_clzero() -> bool {
+        let max_ext = std::arch::x86_64::__cpuid(0x8000_0000).eax;
+        max_ext >= 0x8000_0008 && (std::arch::x86_64::__cpuid(0x8000_0008).ebx & 1) != 0
+    }
+
     #[test]
     fn wait_loop_patches_on_first_fault_and_takes_zero_exceptions_after() {
         crate::report_crashes();
@@ -637,11 +656,23 @@ mod tests {
         let func: unsafe extern "win64" fn(u64) = unsafe { std::mem::transmute(buf.ptr) };
 
         let before = emulated_count();
-        // Run 10,000 iterations: 1st iteration faults once on monitorx + once on mwaitx (2 faults),
-        // patches both to `0F 1F FA` / `0F 1F FB`, and iterations 2..10_000 take 0 faults.
-        unsafe { func(10_000) };
+        if !cpu_has_monitorx() {
+            // Run 10,000 iterations: 1st iteration faults once on monitorx + once on mwaitx (2 faults),
+            // patches both to `0F 1F FA` / `0F 1F FB`, and iterations 2..10_000 take 0 faults.
+            unsafe { func(10_000) };
+            assert_eq!(emulated_count() - before, 2, "expected exactly 2 faults (monitorx + mwaitx) across 10,000 iterations");
+        } else {
+            // CPU supports MONITORX natively: exercise `emulate` directly to patch, then execute NOPs natively.
+            // SAFETY: valid CONTEXTs pointing at the two wait instructions in `buf`.
+            unsafe {
+                let mut ctx: CONTEXT = std::mem::zeroed();
+                ctx.Rip = buf.ptr as u64;
+                assert_eq!(emulate(&mut ctx), CONTINUE_EXECUTION);
+                ctx.Rip = buf.ptr.add(3) as u64;
+                assert_eq!(emulate(&mut ctx), CONTINUE_EXECUTION);
+            }
+        }
         let after_first_run = emulated_count();
-        assert_eq!(after_first_run - before, 2, "expected exactly 2 faults (monitorx + mwaitx) across 10,000 iterations");
         assert_eq!(&buf.bytes()[0..6], &[0x0F, 0x1F, 0xFA, 0x0F, 0x1F, 0xFB]);
         assert_eq!(buf.protect(), PAGE_EXECUTE_READ);
 
@@ -667,9 +698,20 @@ mod tests {
         // SAFETY: valid `extern "win64" fn()` returning cleanly after NOPs.
         let func: unsafe extern "win64" fn() = unsafe { std::mem::transmute(buf.ptr) };
         let before = emulated_count();
-        unsafe { func() };
+        if !cpu_has_monitorx() {
+            unsafe { func() };
+            assert_eq!(emulated_count() - before, 5);
+        } else {
+            // SAFETY: steps through all 5 prefixed instructions via `emulate` directly.
+            unsafe {
+                let mut ctx: CONTEXT = std::mem::zeroed();
+                for off in [0usize, 4, 8, 12, 16] {
+                    ctx.Rip = buf.ptr.add(off) as u64;
+                    assert_eq!(emulate(&mut ctx), CONTINUE_EXECUTION);
+                }
+            }
+        }
         let after_first = emulated_count();
-        assert_eq!(after_first - before, 5);
         assert_eq!(
             buf.bytes(),
             &[
@@ -694,15 +736,27 @@ mod tests {
         let buf = Arc::new(ExecBuf::new(&code));
         let threads = 8;
         let barrier = Arc::new(Barrier::new(threads));
+        let native = !cpu_has_monitorx();
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 let buf = Arc::clone(&buf);
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
-                    // SAFETY: valid `extern "win64" fn(u64)` in PAGE_EXECUTE_READ memory.
-                    let func: unsafe extern "win64" fn(u64) = unsafe { std::mem::transmute(buf.ptr) };
                     barrier.wait();
-                    unsafe { func(10_000) };
+                    if native {
+                        // SAFETY: valid `extern "win64" fn(u64)` in PAGE_EXECUTE_READ memory.
+                        let func: unsafe extern "win64" fn(u64) = unsafe { std::mem::transmute(buf.ptr) };
+                        unsafe { func(10_000) };
+                    } else {
+                        // SAFETY: valid CONTEXTs racing `PATCH_LOCK` on `buf`.
+                        unsafe {
+                            let mut ctx: CONTEXT = std::mem::zeroed();
+                            ctx.Rip = buf.ptr as u64;
+                            assert_eq!(emulate(&mut ctx), CONTINUE_EXECUTION);
+                            ctx.Rip = buf.ptr.add(3) as u64;
+                            assert_eq!(emulate(&mut ctx), CONTINUE_EXECUTION);
+                        }
+                    }
                 })
             })
             .collect();
@@ -756,8 +810,8 @@ mod tests {
         let end = unsafe { arena.0.as_mut_ptr().add(64 * 8 + 16) }; // unaligned end -> 8 lines zeroed (1..9)
         let before = emulated_count();
         let ret = unsafe { f1(start, end) };
-        // Entire 8-line loop ran in 1 exception!
-        assert_eq!(emulated_count() - before, 1);
+        // Entire 8-line loop ran in 1 exception on CPUs without CLZERO (0 on AMD)!
+        assert_eq!(emulated_count() - before, u64::from(!cpu_has_clzero()));
         assert_eq!(ret, unsafe { arena.0.as_ptr().add(64 * 9) } as usize);
         assert!(arena.0[..64].iter().all(|&b| b == 0xA5));
         assert!(arena.0[64..64 * 9].iter().all(|&b| b == 0));
@@ -779,7 +833,7 @@ mod tests {
         arena.0.fill(0x5A);
         let before2 = emulated_count();
         let ret2 = unsafe { f2(arena.0.as_mut_ptr().add(128), 5) };
-        assert_eq!(emulated_count() - before2, 1);
+        assert_eq!(emulated_count() - before2, u64::from(!cpu_has_clzero()));
         assert_eq!(ret2, unsafe { arena.0.as_ptr().add(128 + 5 * 64) } as usize);
         assert!(arena.0[..128].iter().all(|&b| b == 0x5A));
         assert!(arena.0[128..128 + 5 * 64].iter().all(|&b| b == 0));
@@ -838,12 +892,25 @@ mod tests {
             crate::report_crashes();
             let code = [0x0F, 0x01, 0xFA, 0x0F, 0x01, 0xFB, 0x48, 0xFF, 0xC9, 0x75, 0xF5, 0xC3];
             let buf = ExecBuf::new(&code);
-            // SAFETY: valid `extern "win64" fn(u64)` in PAGE_EXECUTE_READ memory.
-            let func: unsafe extern "win64" fn(u64) = unsafe { std::mem::transmute(buf.ptr) };
             let before = emulated_count();
-            unsafe { func(ITERS) };
+            if !cpu_has_monitorx() {
+                // SAFETY: valid `extern "win64" fn(u64)` in PAGE_EXECUTE_READ memory.
+                let func: unsafe extern "win64" fn(u64) = unsafe { std::mem::transmute(buf.ptr) };
+                unsafe { func(ITERS) };
+            } else {
+                // SAFETY: exercises `emulate` directly on CPUs that natively execute MONITORX.
+                unsafe {
+                    let mut ctx: CONTEXT = std::mem::zeroed();
+                    for _ in 0..ITERS {
+                        ctx.Rip = buf.ptr as u64;
+                        assert_eq!(emulate(&mut ctx), CONTINUE_EXECUTION);
+                        ctx.Rip = buf.ptr.add(3) as u64;
+                        assert_eq!(emulate(&mut ctx), CONTINUE_EXECUTION);
+                    }
+                }
+            }
             let faults = emulated_count() - before;
-            assert_eq!(faults, ITERS * 2, "unpatched mode must fault every iteration");
+            assert_eq!(faults, ITERS * 2, "unpatched mode must emulate every iteration");
             assert_eq!(&buf.bytes()[0..6], &[0x0F, 0x01, 0xFA, 0x0F, 0x01, 0xFB]);
             return;
         }
@@ -925,13 +992,20 @@ mod tests {
 
             let fa: unsafe extern "win64" fn() = std::mem::transmute(site_a);
             let e0 = emulated_count();
-            fa();
-            assert_eq!(emulated_count() - e0, 1);
+            if !cpu_has_monitorx() {
+                fa();
+                assert_eq!(emulated_count() - e0, 1);
+            } else {
+                let mut ctx: CONTEXT = std::mem::zeroed();
+                ctx.Rip = site_a as u64;
+                assert_eq!(emulate(&mut ctx), CONTINUE_EXECUTION);
+            }
             assert_eq!(std::slice::from_raw_parts(site_a, 4), &[0x0F, 0x1F, 0xFA, 0xC3]);
             assert_eq!(prot_of(p0), PAGE_EXECUTE_READ);
             assert_eq!(prot_of(p1), PAGE_EXECUTE_READWRITE);
+            let e0_after = emulated_count();
             fa();
-            assert_eq!(emulated_count() - e0, 1);
+            assert_eq!(emulated_count(), e0_after);
 
             // Case B: `0F 01` at p0_end - 2, `FA C3` on p1 (patched byte `01` sits on p0!)
             assert_ne!(VirtualProtect(p0.cast(), 0x1000, PAGE_READWRITE, &mut old), 0);
@@ -942,13 +1016,20 @@ mod tests {
 
             let fb: unsafe extern "win64" fn() = std::mem::transmute(site_b);
             let e1 = emulated_count();
-            fb();
-            assert_eq!(emulated_count() - e1, 1);
+            if !cpu_has_monitorx() {
+                fb();
+                assert_eq!(emulated_count() - e1, 1);
+            } else {
+                let mut ctx: CONTEXT = std::mem::zeroed();
+                ctx.Rip = site_b as u64;
+                assert_eq!(emulate(&mut ctx), CONTINUE_EXECUTION);
+            }
             assert_eq!(std::slice::from_raw_parts(site_b, 4), &[0x0F, 0x1F, 0xFA, 0xC3]);
             assert_eq!(prot_of(p0), PAGE_EXECUTE_READ);
             assert_eq!(prot_of(p1), PAGE_EXECUTE_READWRITE);
+            let e1_after = emulated_count();
             fb();
-            assert_eq!(emulated_count() - e1, 1);
+            assert_eq!(emulated_count(), e1_after);
 
             // Case C: 12-byte clzero loop + ret straddling p0 (RX) -> p1 (RWX)
             assert_ne!(VirtualProtect(p0.cast(), 0x1000, PAGE_READWRITE, &mut old), 0);
@@ -972,7 +1053,16 @@ mod tests {
             let fc: unsafe extern "win64" fn(*mut u8, *mut u8) = std::mem::transmute(entry_c);
             let e2 = emulated_count();
             fc(target.0.as_mut_ptr(), target.0.as_mut_ptr().add(64 * 4));
-            assert_eq!(emulated_count() - e2, 1, "straddling clzero loop must execute in 1 fault");
+            assert_eq!(emulated_count() - e2, u64::from(!cpu_has_clzero()), "straddling clzero loop must execute in 1 fault on non-CLZERO CPUs");
+            assert!(target.0.iter().all(|&b| b == 0));
+
+            // Also verify direct `emulate` decodes the straddling clzero loop across RX/RWX on any CPU.
+            target.0.fill(0x55);
+            let mut ctx: CONTEXT = std::mem::zeroed();
+            ctx.Rip = p1.sub(4) as u64;
+            ctx.Rax = target.0.as_mut_ptr() as u64;
+            ctx.Rdx = target.0.as_mut_ptr().add(64 * 4) as u64;
+            assert_eq!(emulate(&mut ctx), CONTINUE_EXECUTION);
             assert!(target.0.iter().all(|&b| b == 0));
 
             VirtualFree(base.cast(), 0, MEM_RELEASE);
@@ -1092,9 +1182,75 @@ mod tests {
     }
 
     #[test]
+    fn clzero_handles_writecopy_guard_and_overflow() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_COPY, MapViewOfFile, PAGE_GUARD, UnmapViewOfFile};
+
+        // 1) `PAGE_WRITECOPY` mapped section view must allow `clzero` and `ClzeroLoop`.
+        // SAFETY: creates an anonymous 1-page section, maps a copy-on-write view, and unmaps/closes it.
+        unsafe {
+            let map = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, 0x1000, std::ptr::null());
+            assert!(!map.is_null());
+            let view = MapViewOfFile(map, FILE_MAP_COPY, 0, 0, 0x1000).Value.cast::<u8>();
+            assert!(!view.is_null());
+            let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(view.cast(), &mut m, size_of_val(&m)), 0);
+            assert_eq!(m.Protect & 0xFF, windows_sys::Win32::System::Memory::PAGE_WRITECOPY);
+
+            let clzero = [0x0F, 0x01, 0xFC];
+            let mut ctx: CONTEXT = std::mem::zeroed();
+            ctx.Rip = clzero.as_ptr() as u64;
+            ctx.Rax = view as u64;
+            assert_eq!(emulate_slice(&mut ctx, &clzero), Some(3));
+            assert!(std::slice::from_raw_parts(view, 64).iter().all(|&b| b == 0));
+
+            let clzero_loop = [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4];
+            ctx = std::mem::zeroed();
+            ctx.Rip = clzero_loop.as_ptr() as u64;
+            ctx.Rax = view.add(64) as u64;
+            ctx.Rdx = view.add(256) as u64;
+            assert_eq!(emulate_slice(&mut ctx, &clzero_loop), Some(12));
+            assert!(std::slice::from_raw_parts(view, 256).iter().all(|&b| b == 0));
+
+            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view.cast() });
+            CloseHandle(map);
+        }
+
+        // 2) `PAGE_READWRITE | PAGE_GUARD` must be refused and never cached in `WRITABLE`.
+        // SAFETY: allocates 1 page with `PAGE_READWRITE | PAGE_GUARD` and frees it.
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD).cast::<u8>();
+            assert!(!page.is_null());
+            let clzero = [0x0F, 0x01, 0xFC];
+            let mut ctx: CONTEXT = std::mem::zeroed();
+            ctx.Rip = clzero.as_ptr() as u64;
+            ctx.Rax = page as u64;
+            assert_eq!(emulate_slice(&mut ctx, &clzero), None);
+            assert_eq!(emulate_slice(&mut ctx, &clzero), None, "guard page must not be cached in WRITABLE");
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+
+        // 3) Overflow addresses near `u64::MAX` must fail cleanly without panicking.
+        // SAFETY: zeroed CONTEXT; `writable` rejects overflow before reading/writing memory.
+        unsafe {
+            let clzero = [0x0F, 0x01, 0xFC];
+            for bad_rax in [u64::MAX, u64::MAX - 31, u64::MAX - 63] {
+                let mut ctx: CONTEXT = std::mem::zeroed();
+                ctx.Rip = clzero.as_ptr() as u64;
+                ctx.Rax = bad_rax;
+                assert_eq!(emulate_slice(&mut ctx, &clzero), None);
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "real CPU microbenchmark: run with `cargo test --release -p victory-loader -- --ignored --nocapture bench_wait_patch`"]
     fn bench_wait_patch_before_vs_after() {
         const ITERS: u64 = 50_000;
+        if cpu_has_monitorx() {
+            println!("BENCH_SKIPPED cpu_has_monitorx=true");
+            return;
+        }
         if let Ok(mode) = std::env::var("VICTORY_BENCH_CHILD") {
             crate::report_crashes();
             let code = [0x0F, 0x01, 0xFA, 0x0F, 0x01, 0xFB, 0x48, 0xFF, 0xC9, 0x75, 0xF5, 0xC3];

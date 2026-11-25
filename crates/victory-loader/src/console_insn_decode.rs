@@ -535,7 +535,7 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
         // Already-patched `monitorx`/`mwaitx` (`0F 01 FA/FB` -> `0F 1F FA/FB`) or `clwb`
         // (`66 [REX] 0F AE /6` -> `66 [REX] 0F 1F /6`).
         (0x1F, Some(0xFA | 0xFB)) => Some((ConsoleOnly::PatchedInsn, i + 3)),
-        (0x1F, Some(m)) if p66 && (m >> 3) & 7 == 6 && m >> 6 != 3 => {
+        (0x1F, Some(m)) if p66 && rep == 0 && (m >> 3) & 7 == 6 && m >> 6 != 3 => {
             Some((ConsoleOnly::PatchedInsn, i + 2 + modrm_len(&code[i + 2..])?))
         }
         (0x0B, _) => Some((ConsoleOnly::Ud2, i + 2)),
@@ -554,8 +554,8 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
                 _ => None,
             }
         }
-        // 66 0F AE /6 with a memory operand (without 66 it is xsaveopt)
-        (0xAE, Some(m)) if p66 && (m >> 3) & 7 == 6 && m >> 6 != 3 => Some((ConsoleOnly::Clwb, i + 2 + modrm_len(&code[i + 2..])?)),
+        // 66 0F AE /6 with a memory operand (without 66 it is xsaveopt; F2/F3 overrides 66 -> #UD)
+        (0xAE, Some(m)) if p66 && rep == 0 && (m >> 3) & 7 == 6 && m >> 6 != 3 => Some((ConsoleOnly::Clwb, i + 2 + modrm_len(&code[i + 2..])?)),
         // F3 0F C7 /7 with a register operand
         (0xC7, Some(m)) if pf3 && (m >> 3) & 7 == 7 && m >> 6 == 3 => Some((ConsoleOnly::Rdpid((m & 7) | (rex & 1) << 3), i + 3)),
         _ => None,
@@ -625,6 +625,11 @@ mod tests {
         assert_eq!(decode(&[0x66, 0x41, 0x0F, 0x1F, 0x74, 0x24, 0x08]), Some((ConsoleOnly::PatchedInsn, 7)));
         assert_eq!(decode(&[0x0F, 0x1F, 0x30]), None);
         assert_eq!(decode(&[0x66, 0x0F, 0x1F, 0x38]), None);
+        assert_eq!(decode(&[0x66, 0xF2, 0x0F, 0xAE, 0x30]), None);
+        assert_eq!(decode(&[0x66, 0xF3, 0x0F, 0xAE, 0x30]), None);
+        assert_eq!(decode(&[0xF2, 0x66, 0x0F, 0xAE, 0x30]), None);
+        assert_eq!(decode(&[0x66, 0xF2, 0x0F, 0x1F, 0x30]), None);
+        assert_eq!(decode(&[0x66, 0xF3, 0x0F, 0x1F, 0x30]), None);
         assert_eq!(decode(&[0x0F, 0x1F, 0x00]), None);
         assert_eq!(decode(&[0xF3, 0x0F, 0x1E, 0xFA]), None);
         assert_eq!(decode(&[0x0F, 0x0B]), Some((ConsoleOnly::Ud2, 2)));
