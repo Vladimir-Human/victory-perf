@@ -88,15 +88,15 @@ const OWN_UPSCALER: Patch<'static> = Patch {
 };
 
 /// Series S gives the title smaller fixed internal graphics/render-target
-/// heaps at boot, which overflow during init (OOM breakpoint) when
-/// `VICTORY_RENDER_SCALE > 0.5` or the own temporal upscaler runs at its
-/// default 2/3 scale. Replacing `xor al, 1` (`34 01`) with `mov al, 1`
-/// (`B0 01`) after the console-type check selects the larger heap table and
-/// matching VA reservation without changing any other Series S behaviour
-/// (and is a no-op on Series X, where the check already returns 0).
+/// heaps at boot (and a smaller 297 MiB transient render-target pool vs 710
+/// MiB on Series X), which overflow during init or streaming when
+/// `VICTORY_RENDER_SCALE > 0.5` or `VICTORY_OWN_UPSCALER=1` is enabled.
+/// Selecting the larger heap table, matching VA reservation, and larger
+/// transient render-target pool avoids these Series S OOM breakpoints while
+/// leaving all other Series S behaviour unchanged (and is a no-op on Series X).
 const LARGER_HEAPS: &[Patch<'static>] = &[
     Patch {
-        what: "heap budget: larger console heap table for render scale > 0.5",
+        what: "heap budget: larger console heap table",
         rva: 0x1e1ced4,
         expect: &[0xE8, 0x67, 0x82, 0x25, 0xFE, 0x34, 0x01],
         new: &[0xE8, 0x67, 0x82, 0x25, 0xFE, 0xB0, 0x01],
@@ -107,12 +107,24 @@ const LARGER_HEAPS: &[Patch<'static>] = &[
         expect: &[0xE8, 0x8B, 0x81, 0x25, 0xFE, 0x34, 0x01],
         new: &[0xE8, 0x8B, 0x81, 0x25, 0xFE, 0xB0, 0x01],
     },
+    Patch {
+        what: "heap budget: larger transient render-target pool",
+        rva: 0x1d488ac,
+        // mov eax, 0x1290 (297 MiB); mov esi, 0x2c60 (710 MiB); cmovne rsi, rax
+        expect: &[
+            0xB8, 0x90, 0x12, 0x00, 0x00, 0xBE, 0x60, 0x2C, 0x00, 0x00, 0x48, 0x0F, 0x45, 0xF0,
+        ],
+        // NOP the cmovne so the 710 MiB pool is kept on Series S too.
+        new: &[
+            0xB8, 0x90, 0x12, 0x00, 0x00, 0xBE, 0x60, 0x2C, 0x00, 0x00, 0x0F, 0x1F, 0x40, 0x00,
+        ],
+    },
 ];
 
 /// Whether the requested resolution/upscaler overrides exceed the smaller
 /// console profile's fixed render-target heap budget.
 fn needs_larger_heaps(scale: Option<f32>, own_upscaler: bool) -> bool {
-    scale.map_or(own_upscaler, |s| s > 0.5)
+    own_upscaler || scale.is_some_and(|s| s > 0.5)
 }
 
 /// Read-only float constants of this build usable as the FSR scale:
@@ -294,10 +306,11 @@ mod tests {
     }
 
     #[test]
-    fn larger_heaps_apply_above_half_scale_or_default_own_upscaler() {
+    fn larger_heaps_apply_above_half_scale_or_with_own_upscaler() {
         assert!(!needs_larger_heaps(None, false));
-        assert!(!needs_larger_heaps(Some(0.5), true));
         assert!(!needs_larger_heaps(Some(0.4), false));
+        assert!(!needs_larger_heaps(Some(0.5), false));
+        assert!(needs_larger_heaps(Some(0.5), true));
         assert!(needs_larger_heaps(None, true));
         assert!(needs_larger_heaps(Some(0.6), true));
         assert!(needs_larger_heaps(Some(0.75), false));
