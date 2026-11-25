@@ -87,6 +87,34 @@ const OWN_UPSCALER: Patch<'static> = Patch {
     new: &[0x0F, 0x1F, 0x00],
 };
 
+/// Series S gives the title smaller fixed internal graphics/render-target
+/// heaps at boot, which overflow during init (OOM breakpoint) when
+/// `VICTORY_RENDER_SCALE > 0.5` or the own temporal upscaler runs at its
+/// default 2/3 scale. Replacing `xor al, 1` (`34 01`) with `mov al, 1`
+/// (`B0 01`) after the console-type check selects the larger heap table and
+/// matching VA reservation without changing any other Series S behaviour
+/// (and is a no-op on Series X, where the check already returns 0).
+const LARGER_HEAPS: &[Patch<'static>] = &[
+    Patch {
+        what: "heap budget: larger console heap table for render scale > 0.5",
+        rva: 0x1e1ced4,
+        expect: &[0xE8, 0x67, 0x82, 0x25, 0xFE, 0x34, 0x01],
+        new: &[0xE8, 0x67, 0x82, 0x25, 0xFE, 0xB0, 0x01],
+    },
+    Patch {
+        what: "heap budget: matching virtual address reservation",
+        rva: 0x1e1cfb0,
+        expect: &[0xE8, 0x8B, 0x81, 0x25, 0xFE, 0x34, 0x01],
+        new: &[0xE8, 0x8B, 0x81, 0x25, 0xFE, 0xB0, 0x01],
+    },
+];
+
+/// Whether the requested resolution/upscaler overrides exceed the smaller
+/// console profile's fixed render-target heap budget.
+fn needs_larger_heaps(scale: Option<f32>, own_upscaler: bool) -> bool {
+    scale.map_or(own_upscaler, |s| s > 0.5)
+}
+
 /// Read-only float constants of this build usable as the FSR scale:
 /// value, RVA.
 const FSR_SCALES: [(f32, usize); 4] = [
@@ -177,8 +205,8 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
         // SAFETY: forwarded from this function's contract.
         applied += usize::from(unsafe { apply(base, &OWN_UPSCALER) });
     }
-    if let Some(text) = scale {
-        match parse_scale(&text) {
+    let parsed_scale = match scale {
+        Some(text) => match parse_scale(&text) {
             Some(scale) => {
                 // With the own upscaler forced, FSR is left as it is.
                 for p in render_scale_patches(base, scale, !own) {
@@ -191,8 +219,19 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
                     // SAFETY: forwarded from this function's contract.
                     applied += usize::from(unsafe { apply(base, &p) });
                 }
+                Some(scale)
             }
-            None => tracing::warn!(text, "{RENDER_SCALE_ENV} wants a number in 0.2..=1.0"),
+            None => {
+                tracing::warn!(text, "{RENDER_SCALE_ENV} wants a number in 0.2..=1.0");
+                None
+            }
+        },
+        None => None,
+    };
+    if needs_larger_heaps(parsed_scale, own) {
+        for p in LARGER_HEAPS {
+            // SAFETY: forwarded from this function's contract.
+            applied += usize::from(unsafe { apply(base, p) });
         }
     }
     applied
@@ -252,5 +291,17 @@ mod tests {
     fn odd_scales_patch_only_the_own_upscaler() {
         assert_eq!(render_scale_patches(0, 0.6, true).len(), 2);
         assert_eq!(render_scale_patches(0, 0.5, false).len(), 2);
+    }
+
+    #[test]
+    fn larger_heaps_apply_above_half_scale_or_default_own_upscaler() {
+        assert!(!needs_larger_heaps(None, false));
+        assert!(!needs_larger_heaps(Some(0.5), true));
+        assert!(!needs_larger_heaps(Some(0.4), false));
+        assert!(needs_larger_heaps(None, true));
+        assert!(needs_larger_heaps(Some(0.6), true));
+        assert!(needs_larger_heaps(Some(0.75), false));
+        assert!(needs_larger_heaps(Some(1.0), true));
+        assert!(LARGER_HEAPS.iter().all(|p| p.new.len() == p.expect.len()));
     }
 }
