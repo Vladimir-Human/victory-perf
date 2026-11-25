@@ -167,12 +167,14 @@ pub(crate) fn detile(
         copy_thick_detile(&plan, tiled, linear);
         return Ok(());
     }
+    let tiled_len = tiled.len();
+    let linear_len = linear.len();
     copy_thin_tiled(
         &plan,
         tiled.as_ptr(),
-        tiled.len(),
+        tiled_len,
         linear.as_mut_ptr(),
-        linear.len(),
+        linear_len,
         Direction::Detile,
         use_avx2(),
     );
@@ -206,12 +208,14 @@ pub(crate) fn tile(
         copy_thick_tile(&plan, tiled, linear);
         return Ok(());
     }
+    let tiled_len = tiled.len();
+    let linear_len = linear.len();
     copy_thin_tiled(
         &plan,
         tiled.as_mut_ptr(),
-        tiled.len(),
+        tiled_len,
         linear.as_ptr().cast_mut(),
-        linear.len(),
+        linear_len,
         Direction::Tile,
         use_avx2(),
     );
@@ -244,12 +248,14 @@ pub(crate) fn detile_portable(
     } else if layout.thick {
         copy_thick_detile(&plan, tiled, linear);
     } else {
+        let tiled_len = tiled.len();
+        let linear_len = linear.len();
         copy_thin_tiled(
             &plan,
             tiled.as_ptr(),
-            tiled.len(),
+            tiled_len,
             linear.as_mut_ptr(),
-            linear.len(),
+            linear_len,
             Direction::Detile,
             false,
         );
@@ -281,12 +287,14 @@ pub(crate) fn tile_portable(
     } else if layout.thick {
         copy_thick_tile(&plan, tiled, linear);
     } else {
+        let tiled_len = tiled.len();
+        let linear_len = linear.len();
         copy_thin_tiled(
             &plan,
             tiled.as_mut_ptr(),
-            tiled.len(),
+            tiled_len,
             linear.as_ptr().cast_mut(),
-            linear.len(),
+            linear_len,
             Direction::Tile,
             false,
         );
@@ -496,6 +504,7 @@ struct ThinStripParams {
     x_in_block: [usize; 16],
     y_in_block: [usize; 16],
     row_pitch: usize,
+    #[cfg(target_arch = "x86_64")]
     avx2: bool,
     dir: Direction,
 }
@@ -729,6 +738,8 @@ fn copy_thin_tiled(
     dir: Direction,
     avx2: bool,
 ) {
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = avx2;
     let layout = plan.layout;
     let m = &plan.mip_info;
     let element_log2 = layout.desc.element_bytes.trailing_zeros();
@@ -787,6 +798,7 @@ fn copy_thin_tiled(
         x_in_block,
         y_in_block,
         row_pitch: plan.row_pitch,
+        #[cfg(target_arch = "x86_64")]
         avx2,
         dir,
     };
@@ -974,6 +986,7 @@ unsafe impl Send for Job {}
 struct PoolState {
     generation: u64,
     job: Option<Job>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
 }
 
 struct DetilePool {
@@ -1002,6 +1015,7 @@ impl DetilePool {
                 state: Mutex::new(PoolState {
                     generation: 0,
                     job: None,
+                    panic: None,
                 }),
                 work_cv: Condvar::new(),
                 remaining: AtomicUsize::new(0),
@@ -1058,8 +1072,16 @@ impl DetilePool {
                     }
                 }
                 let _done_guard = DoneGuard(self);
-                if start < end {
-                    func(ctx, start, end);
+                if start < end
+                    && let Err(payload) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            func(ctx, start, end);
+                        }))
+                {
+                    let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.panic.is_none() {
+                        guard.panic = Some(payload);
+                    }
                 }
             }
         }
@@ -1072,10 +1094,15 @@ impl DetilePool {
             return;
         }
         // If another thread is already using the pool, run inline to avoid
-        // blocking or deadlocking under concurrent callers.
-        let Ok(_busy_guard) = self.busy.try_lock() else {
-            f(0, total_units);
-            return;
+        // blocking or deadlocking under concurrent callers. Recover cleanly
+        // if a previous caller panicked while holding `busy`.
+        let _busy_guard = match self.busy.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                f(0, total_units);
+                return;
+            }
         };
 
         let active_threads = total_units.min(workers + 1);
@@ -1102,6 +1129,7 @@ impl DetilePool {
                         .wait(done)
                         .unwrap_or_else(|e| e.into_inner());
                 }
+                drop(done);
                 let mut state = self.pool.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.job = None;
             }
@@ -1110,6 +1138,7 @@ impl DetilePool {
         self.remaining.store(active_workers, Ordering::Release);
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.panic = None;
             state.job = Some(Job {
                 func: trampoline::<F>,
                 ctx: (&raw const f).cast::<()>(),
@@ -1119,12 +1148,21 @@ impl DetilePool {
             state.generation = state.generation.wrapping_add(1);
             self.work_cv.notify_all();
         }
-        let _wait = WaitGuard { pool: self };
+        let wait = WaitGuard { pool: self };
 
         // Caller processes slice 0 while workers process slices 1..active_threads.
         let (s0, e0) = split_range(total_units, active_threads, 0);
         if s0 < e0 {
             f(s0, e0);
+        }
+
+        drop(wait);
+        let worker_panic = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.panic.take()
+        };
+        if let Some(payload) = worker_panic {
+            std::panic::resume_unwind(payload);
         }
     }
 }
@@ -1760,5 +1798,62 @@ unsafe fn tile_16x16_d1_sse2(tiled: *mut u8, linear: *const u8, pitch: usize) {
             _mm_storeu_si128(tiled.add(base + 16).cast(), _mm_unpacklo_epi64(r1, r3));
             _mm_storeu_si128(tiled.add(base + 80).cast(), _mm_unpackhi_epi64(r1, r3));
         }
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Verifies that a panic inside a worker thread propagates to the caller,
+    /// keeps the worker alive (no deadlock on subsequent calls), and that a
+    /// panic on the caller thread does not poison `busy` into single-threaded
+    /// fallback.
+    #[test]
+    fn detile_pool_recovers_from_worker_and_caller_panics() {
+        let pool = DetilePool::global();
+        let workers = pool.workers.load(Ordering::Acquire);
+        if workers == 0 {
+            return;
+        }
+        let total = workers + 1;
+
+        // 1. Worker panic propagates cleanly and leaves all workers alive.
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.run(total, |s, _e| {
+                if s > 0 {
+                    panic!("simulated worker panic");
+                }
+            });
+        }));
+        assert!(res.is_err(), "worker panic must propagate to caller");
+
+        // 2. Caller panic unwinds cleanly without poisoning `busy`.
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.run(total, |s, _e| {
+                if s == 0 {
+                    panic!("simulated caller panic");
+                }
+            });
+        }));
+        assert!(res.is_err(), "caller panic must propagate");
+
+        // 3. Subsequent dispatch still succeeds across multiple threads (no
+        //    hang and no permanent fallback to single-threaded execution).
+        let seen = Mutex::new(HashSet::new());
+        let sum = AtomicUsize::new(0);
+        pool.run(total * 4, |s, e| {
+            seen.lock().unwrap().insert(std::thread::current().id());
+            for i in s..e {
+                sum.fetch_add(i + 1, Ordering::Relaxed);
+            }
+        });
+        let n = total * 4;
+        assert_eq!(sum.load(Ordering::Relaxed), n * (n + 1) / 2);
+        assert!(
+            seen.lock().unwrap().len() >= 2,
+            "pool should still execute across worker threads after recovery"
+        );
     }
 }

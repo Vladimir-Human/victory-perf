@@ -309,6 +309,7 @@ struct PacingSnapshot {
 struct StreamingPacer {
     last_wait_frame: Option<u64>,
     consecutive_wait_frames: u32,
+    had_loading_wait: bool,
     steady_state: bool,
 }
 
@@ -317,14 +318,19 @@ impl StreamingPacer {
         Self {
             last_wait_frame: None,
             consecutive_wait_frames: 0,
+            had_loading_wait: false,
             steady_state: false,
         }
     }
 
-    fn observe_frame(&mut self, frame: u64, had_loading_wait: bool) -> PacingSnapshot {
+    fn note_loading_wait(&mut self) {
+        self.had_loading_wait = true;
+    }
+
+    fn observe_frame(&mut self, frame: u64) -> PacingSnapshot {
         match self.last_wait_frame {
             None => {
-                if had_loading_wait && frame >= STEADY_QUIET_FRAMES {
+                if self.had_loading_wait && frame >= STEADY_QUIET_FRAMES {
                     self.steady_state = true;
                 }
                 self.consecutive_wait_frames = 0;
@@ -333,7 +339,7 @@ impl StreamingPacer {
             Some(prev) if frame == prev => {}
             Some(prev) if frame > prev => {
                 let quiet_gap = frame - prev - 1;
-                if had_loading_wait && quiet_gap >= STEADY_QUIET_FRAMES {
+                if self.had_loading_wait && quiet_gap >= STEADY_QUIET_FRAMES {
                     self.steady_state = true;
                 }
                 if quiet_gap == 0 {
@@ -500,13 +506,16 @@ fn sharing_from(value: Option<&str>) -> Sharing {
     }
 }
 
-/// One frame's waiting for one kind of pipeline.
+/// One frame's shared waiting across graphics and compute pipelines.
 #[derive(Debug)]
 struct FrameWait {
     frame: u64,
     /// The waiting counted against the budget so far (the window: time in
     /// which some thread waited, up to `since`).
     spent: Duration,
+    /// How much of this frame's total waiting beyond `base` has already been
+    /// charged against the run's loading allowance.
+    charged_past: Duration,
     /// The window: threads waiting now, and since when one has been.
     waiting: u32,
     since: Option<Instant>,
@@ -514,7 +523,13 @@ struct FrameWait {
 
 impl FrameWait {
     const fn new() -> FrameWait {
-        FrameWait { frame: u64::MAX, spent: Duration::ZERO, waiting: 0, since: None }
+        FrameWait {
+            frame: u64::MAX,
+            spent: Duration::ZERO,
+            charged_past: Duration::ZERO,
+            waiting: 0,
+            since: None,
+        }
     }
 
     /// A thread is to wait in `frame` at `now`: how long it may.
@@ -541,11 +556,21 @@ impl FrameWait {
     }
 
     /// The thread that [`begin`](Self::begin) gave `left` (more than
-    /// nothing) in `frame` has waited `waited`, and stops at `now`. A frame
-    /// that began meanwhile has its own budget.
-    fn end(&mut self, sharing: Sharing, frame: u64, left: Duration, waited: Duration, now: Instant) {
+    /// nothing) in `frame` has waited `waited`, and stops at `now`. Returns
+    /// the incremental waiting in this frame past `base` that has not yet
+    /// been charged to the loading allowance. A frame that began meanwhile
+    /// has its own budget.
+    fn end(
+        &mut self,
+        sharing: Sharing,
+        frame: u64,
+        left: Duration,
+        waited: Duration,
+        base: Duration,
+        now: Instant,
+    ) -> Duration {
         if self.frame != frame {
-            return;
+            return Duration::ZERO;
         }
         match sharing {
             Sharing::Window => {
@@ -559,6 +584,19 @@ impl FrameWait {
             Sharing::Reserve => self.spent = self.spent.saturating_sub(left - waited),
             Sharing::PerThread => self.spent += waited,
         }
+        let total_spent = match sharing {
+            Sharing::Window => {
+                self.spent
+                    + self
+                        .since
+                        .map_or(Duration::ZERO, |at| now.saturating_duration_since(at))
+            }
+            Sharing::Reserve | Sharing::PerThread => self.spent,
+        };
+        let total_past = total_spent.saturating_sub(base);
+        let delta_past = total_past.saturating_sub(self.charged_past);
+        self.charged_past += delta_past;
+        delta_past
     }
 }
 
@@ -575,8 +613,6 @@ fn wait(p: &Pending, frame: u64) {
     let compute = p.computes();
     let past = &PAST[usize::from(compute)];
     let spent = Duration::from_millis(past.load(Ordering::Relaxed));
-    let had_loading_wait =
-        PAST[0].load(Ordering::Relaxed) > 0 || PAST[1].load(Ordering::Relaxed) > 0;
     // Single shared frame wait window and streaming pacer across all threads
     // and both pipeline kinds, preventing graphics + compute budgets from
     // stacking back-to-back within one frame.
@@ -587,7 +623,7 @@ fn wait(p: &Pending, frame: u64) {
     let (snapshot, left) = {
         let mut guard = FRAME_WAIT.lock().unwrap_or_else(|e| e.into_inner());
         let (frame_wait, pacer) = &mut *guard;
-        let snapshot = pacer.observe_frame(frame, had_loading_wait);
+        let snapshot = pacer.observe_frame(frame);
         let budget = effective_budget(
             config,
             compute,
@@ -615,17 +651,18 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
-    if !snapshot.steady_state || config.explicit {
-        past.fetch_add(
-            waited.saturating_sub(config.base).as_millis() as u64,
-            Ordering::Relaxed,
-        );
+    let delta_past = {
+        let mut guard = FRAME_WAIT.lock().unwrap_or_else(|e| e.into_inner());
+        let (frame_wait, pacer) = &mut *guard;
+        let delta = frame_wait.end(sharing, frame, left, waited, config.base, Instant::now());
+        if !snapshot.steady_state && !delta.is_zero() {
+            pacer.note_loading_wait();
+        }
+        delta
+    };
+    if (!snapshot.steady_state || config.explicit) && !delta_past.is_zero() {
+        past.fetch_add(delta_past.as_millis() as u64, Ordering::Relaxed);
     }
-    FRAME_WAIT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .0
-        .end(sharing, frame, left, waited, Instant::now());
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -791,11 +828,22 @@ mod loading_tests {
         assert_eq!(a, budget);
         assert_eq!(b, budget - ms, "the second thread drops its pipeline at once: {sharing:?} gives it {b:?}");
         // Both made after 2 s: 2 s of the window gone.
-        w.end(sharing, 7, a, Duration::from_secs(2), t0 + Duration::from_secs(2));
-        w.end(sharing, 7, b, Duration::from_secs(2) - ms, t0 + Duration::from_secs(2));
+        let base = Duration::from_millis(500);
+        assert_eq!(
+            w.end(sharing, 7, a, Duration::from_secs(2), base, t0 + Duration::from_secs(2)),
+            Duration::from_millis(1_500)
+        );
+        // Overlapping second thread ending at the same instant does not double-count.
+        assert_eq!(
+            w.end(sharing, 7, b, Duration::from_secs(2) - ms, base, t0 + Duration::from_secs(2)),
+            Duration::ZERO
+        );
         assert_eq!(w.begin(sharing, 7, budget, t0 + Duration::from_secs(5)), Duration::from_secs(10));
         // That thread waits out the rest: the window is used up.
-        w.end(sharing, 7, Duration::from_secs(10), Duration::from_secs(10), t0 + Duration::from_secs(15));
+        assert_eq!(
+            w.end(sharing, 7, Duration::from_secs(10), Duration::from_secs(10), base, t0 + Duration::from_secs(15)),
+            Duration::from_secs(10)
+        );
         assert_eq!(w.begin(sharing, 7, budget, t0 + Duration::from_secs(16)), Duration::ZERO);
         // The next frame.
         assert_eq!(w.begin(sharing, 8, budget, t0 + Duration::from_secs(17)), budget);
@@ -806,21 +854,24 @@ mod loading_tests {
     /// each thread counts only waits that have ended.
     #[test]
     fn the_old_ways_of_counting_stay_behind_the_switch() {
-        let (budget, t0) = (Duration::from_secs(12), Instant::now());
+        let (budget, base, t0) = (Duration::from_secs(12), Duration::from_millis(500), Instant::now());
         let mut w = FrameWait::new();
         assert_eq!(w.begin(Sharing::Reserve, 1, budget, t0), budget);
         assert_eq!(w.begin(Sharing::Reserve, 1, budget, t0), Duration::ZERO);
         let mut w = FrameWait::new();
         assert_eq!(w.begin(Sharing::PerThread, 1, budget, t0), budget);
         assert_eq!(w.begin(Sharing::PerThread, 1, budget, t0), budget);
-        w.end(Sharing::PerThread, 1, budget, Duration::from_secs(3), t0);
+        assert_eq!(
+            w.end(Sharing::PerThread, 1, budget, Duration::from_secs(3), base, t0),
+            Duration::from_millis(2_500)
+        );
         assert_eq!(w.begin(Sharing::PerThread, 1, budget, t0), Duration::from_secs(9));
         assert_eq!(sharing_from(Some("0")), Sharing::PerThread);
         assert_eq!(sharing_from(Some("reserve")), Sharing::Reserve);
     }
 
     /// While a run's allowance lasts a frame may wait 4 s for a graphics
-    /// pipeline and 12 s for a compute one, then only the frame budget; a
+    /// pipeline and 10 s for a compute one, then only the frame budget; a
     /// budget set above them stays.
     #[test]
     fn a_frame_waits_longer_while_the_loading_allowance_lasts() {
@@ -868,15 +919,22 @@ mod loading_tests {
         let mut w = FrameWait::new();
 
         // Graphics uses 3 s of its 4 s loading cap inside frame 10.
+        let base = Duration::from_millis(DEFAULT_WAIT_MS);
         let g = w.begin(sharing, 10, LOADING_FRAME, t0);
         assert_eq!(g, LOADING_FRAME);
-        w.end(sharing, 10, g, Duration::from_secs(3), t0 + Duration::from_secs(3));
+        assert_eq!(
+            w.end(sharing, 10, g, Duration::from_secs(3), base, t0 + Duration::from_secs(3)),
+            Duration::from_millis(2_500)
+        );
 
         // Compute arrives later in the same frame: it gets the remainder of
         // LOADING_FRAME_COMPUTE (10 s - 3 s = 7 s), never another full 10 s.
         let c = w.begin(sharing, 10, LOADING_FRAME_COMPUTE, t0 + Duration::from_secs(3));
         assert_eq!(c, LOADING_FRAME_COMPUTE - Duration::from_secs(3));
-        w.end(sharing, 10, c, Duration::from_secs(2), t0 + Duration::from_secs(5));
+        assert_eq!(
+            w.end(sharing, 10, c, Duration::from_secs(2), base, t0 + Duration::from_secs(5)),
+            Duration::from_secs(2)
+        );
 
         // Total spent in frame 10 is 5 s, which already exceeds graphics' 4 s
         // budget: a subsequent graphics wait gets zero rather than stalling.
@@ -888,9 +946,11 @@ mod loading_tests {
     }
 
     /// Streaming pacer preserves initial loading protection across quiet menu
-    /// frames before a real world load, transitions into steady-state once
-    /// enough quiet frames pass after loading, decays on consecutive waiting
-    /// frames and queue buildup, and resets the streak after a quiet frame.
+    /// frames before a real world load, accounts cumulative frame excess even
+    /// when each individual wait is <= 500 ms, transitions into steady-state
+    /// once enough quiet frames pass after loading, decays on consecutive
+    /// waiting frames and queue buildup, and resets the streak after a quiet
+    /// frame.
     #[test]
     fn streaming_pacer_transitions_decays_and_resets() {
         let default_cfg = WaitConfig {
@@ -899,12 +959,31 @@ mod loading_tests {
         };
         let allowance = Duration::from_secs(120);
         let mut pacer = StreamingPacer::new();
+        let mut fw = FrameWait::new();
+        let sharing = sharing_from(None);
+        let t0 = Instant::now();
 
-        // Splash / menu idle for 100 quiet frames before any heavy load must
-        // not prematurely enter steady state and drop one-shot load passes.
-        let s_menu = pacer.observe_frame(1, false);
+        // Cheap splash/menu frame (5 x 50 ms = 250 ms <= 500 ms) followed by
+        // 100 quiet frames must not prematurely enter steady state.
+        let s_menu = pacer.observe_frame(1);
         assert!(!s_menu.steady_state);
-        let s_load = pacer.observe_frame(100, false);
+        for i in 0..5u64 {
+            let start = t0 + Duration::from_millis(i * 50);
+            let left = fw.begin(sharing, 1, LOADING_FRAME, start);
+            let delta = fw.end(
+                sharing,
+                1,
+                left,
+                Duration::from_millis(50),
+                default_cfg.base,
+                start + Duration::from_millis(50),
+            );
+            assert_eq!(delta, Duration::ZERO);
+        }
+
+        // Frame 100: real world load composed of 10 sequential 400 ms waits
+        // (each individual wait <= 500 ms, but frame total = 4,000 ms).
+        let s_load = pacer.observe_frame(100);
         assert!(!s_load.steady_state);
         assert_eq!(s_load.streak, 0);
         assert_eq!(
@@ -915,34 +994,54 @@ mod loading_tests {
             effective_budget(default_cfg, true, allowance, Duration::ZERO, 4, s_load),
             LOADING_FRAME_COMPUTE
         );
+        let mut charged = Duration::ZERO;
+        let load_t0 = t0 + Duration::from_secs(10);
+        for i in 0..10u64 {
+            let start = load_t0 + Duration::from_millis(i * 400);
+            let left = fw.begin(sharing, 100, LOADING_FRAME, start);
+            assert!(!left.is_zero());
+            let delta = fw.end(
+                sharing,
+                100,
+                left,
+                Duration::from_millis(400),
+                default_cfg.base,
+                start + Duration::from_millis(400),
+            );
+            if !delta.is_zero() {
+                pacer.note_loading_wait();
+                charged += delta;
+            }
+        }
+        assert_eq!(charged, Duration::from_millis(3_500));
 
         // Multiple waits within the same frame do not increment streak.
-        assert_eq!(pacer.observe_frame(100, true), s_load);
+        assert_eq!(pacer.observe_frame(100), s_load);
 
         // After loading spent allowance and STEADY_QUIET_FRAMES wait-free
         // frames elapse, we enter steady state.
         let steady_frame = 100 + STEADY_QUIET_FRAMES + 1;
-        let s_steady = pacer.observe_frame(steady_frame, true);
+        let s_steady = pacer.observe_frame(steady_frame);
         assert!(s_steady.steady_state);
         assert_eq!(s_steady.streak, 0);
         assert_eq!(
-            effective_budget(default_cfg, false, allowance, Duration::from_secs(5), 1, s_steady),
+            effective_budget(default_cfg, false, allowance, charged, 1, s_steady),
             STREAMING_BASE_GFX
         );
         assert_eq!(
-            effective_budget(default_cfg, true, allowance, Duration::from_secs(5), 1, s_steady),
+            effective_budget(default_cfg, true, allowance, charged, 1, s_steady),
             STREAMING_BASE_COMPUTE
         );
 
         // Consecutive waiting frames halve the streaming budget down to floor.
-        let s_next = pacer.observe_frame(steady_frame + 1, true);
+        let s_next = pacer.observe_frame(steady_frame + 1);
         assert_eq!(s_next.streak, 1);
         assert_eq!(
-            effective_budget(default_cfg, false, allowance, Duration::from_secs(5), 1, s_next),
+            effective_budget(default_cfg, false, allowance, charged, 1, s_next),
             Duration::from_millis(60)
         );
         assert_eq!(
-            effective_budget(default_cfg, true, allowance, Duration::from_secs(5), 1, s_next),
+            effective_budget(default_cfg, true, allowance, charged, 1, s_next),
             Duration::from_millis(250)
         );
 
@@ -952,7 +1051,7 @@ mod loading_tests {
                 default_cfg,
                 false,
                 allowance,
-                Duration::from_secs(5),
+                charged,
                 QUEUE_PRESSURE_THRESHOLD,
                 s_next
             ),
@@ -965,20 +1064,20 @@ mod loading_tests {
             streak: 10,
         };
         assert_eq!(
-            effective_budget(default_cfg, false, allowance, Duration::from_secs(5), 100, deep),
+            effective_budget(default_cfg, false, allowance, charged, 100, deep),
             STREAMING_FLOOR_GFX
         );
         assert_eq!(
-            effective_budget(default_cfg, true, allowance, Duration::from_secs(5), 100, deep),
+            effective_budget(default_cfg, true, allowance, charged, 100, deep),
             STREAMING_FLOOR_COMPUTE
         );
 
         // One wait-free frame resets the consecutive streak while staying steady.
-        let s_reset = pacer.observe_frame(steady_frame + 3, true);
+        let s_reset = pacer.observe_frame(steady_frame + 3);
         assert!(s_reset.steady_state);
         assert_eq!(s_reset.streak, 0);
         assert_eq!(
-            effective_budget(default_cfg, false, allowance, Duration::from_secs(5), 0, s_reset),
+            effective_budget(default_cfg, false, allowance, charged, 0, s_reset),
             STREAMING_BASE_GFX
         );
     }
@@ -1046,7 +1145,8 @@ mod tests {
         let p = Arc::new(p);
         // No frame budget on this thread (`VICTORY_PIPELINE_WAIT_MS=0`):
         // the request is not waited for, where the default would wait out
-        // a 12 s window for a pipeline that is never made.
+        // the frame window (500 ms base, up to 4 s / 10 s during loading) for
+        // a pipeline that is never made.
         super::TEST_BUDGET.set(Some(std::time::Duration::ZERO));
 
         assert!(!super::super::library::wanted_early(&p.key));
