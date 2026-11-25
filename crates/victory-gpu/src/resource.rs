@@ -1389,8 +1389,8 @@ pub(crate) fn room() -> bool {
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 75 unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). Leaving ~25%
+/// textures picked by index are made ([`room`]): 82 unless
+/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). Leaving ~18%
 /// headroom keeps hot compute/skinning card buffers (which may use up to
 /// `VICTORY_CARD_VRAM_PERCENT`, default 92%) in local VRAM instead of
 /// spilling onto PCIe shared memory.

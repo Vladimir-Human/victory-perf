@@ -392,6 +392,15 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+fn unsupported_compute_wave(
+    required_wave: Option<u32>,
+    wave_lanes: Option<(u32, u32)>,
+) -> Option<(u32, u32, u32)> {
+    let req = required_wave?;
+    let (min, max) = wave_lanes?;
+    (!(min..=max).contains(&req)).then_some((req, min, max))
+}
+
 /// Appends one translated stage's root parameters and static samplers to a
 /// host root signature description, returning the slot-to-parameter bindings
 /// for that stage. Shared between runtime pipeline creation and offline
@@ -645,7 +654,19 @@ impl HostPipeline {
                 },
             )
         };
-        if compute.is_some() {
+        if let Some(cs) = compute {
+            let required_wave = cs.translated().and_then(|t| t.host.required_wave_size());
+            if let Some((req, min, max)) = unsupported_compute_wave(required_wave, host.wave_lanes)
+            {
+                tracing::warn!(
+                    ?shaders,
+                    required_wave = req,
+                    device_min = min,
+                    device_max = max,
+                    "compute shader requires wave{req} but host GPU supports {min}..={max}. Skipping pipeline creation"
+                );
+                return None;
+            }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -1580,5 +1601,30 @@ mod tests {
             255,
             "depth 0.5 inside [0.4, 0.6] must pass"
         );
+    }
+
+    #[test]
+    fn wave_size_precheck_rejects_both_outside_bounds() {
+        assert_eq!(
+            unsupported_compute_wave(Some(32), Some((64, 64))),
+            Some((32, 64, 64)),
+        );
+        assert_eq!(
+            unsupported_compute_wave(Some(64), Some((32, 32))),
+            Some((64, 32, 32)),
+        );
+    }
+
+    #[test]
+    fn wave_size_precheck_accepts_boundaries_or_unknown_constraints() {
+        for supported in [16, 32, 64] {
+            assert_eq!(
+                unsupported_compute_wave(Some(supported), Some((16, 64))),
+                None,
+            );
+        }
+        assert_eq!(unsupported_compute_wave(Some(64), Some((64, 64))), None);
+        assert_eq!(unsupported_compute_wave(None, Some((64, 64))), None);
+        assert_eq!(unsupported_compute_wave(Some(32), None), None);
     }
 }

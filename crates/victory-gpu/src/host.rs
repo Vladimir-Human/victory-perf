@@ -38,6 +38,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) wave_lanes: Option<(u32, u32)>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -730,9 +731,14 @@ fn create() -> windows::core::Result<Host> {
             a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own).ok().map(|()| own.Budget)
         });
         crate::rebar::probe(&device, card_budget);
+        let wave_lanes = crate::device::query_wave_lane_limits(&device);
+        if let Some((min, max)) = wave_lanes {
+            tracing::info!(min, max, "host wave lane limits");
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
+            wave_lanes,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -2029,7 +2035,7 @@ pub(crate) fn late() -> bool {
     late_stage() > 0
 }
 
-/// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
+/// `VICTORY_LATE_WAIT`: 0 (off), 1, 2 ([`late_exact`]), or 3 ([`late_free_present`]).
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
@@ -2137,6 +2143,17 @@ fn relay_exact() -> bool {
     // since the walls of the first room were found drawn in every run with
     // this set and in fewer than half without it).
     *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
+}
+
+/// Active `VICTORY_RELAY` stage: 0 (off), 1, or 2 ([`relay_exact`]).
+fn relay_stage() -> u8 {
+    if relay_exact() {
+        2
+    } else if relay() {
+        1
+    } else {
+        0
+    }
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -2667,19 +2684,21 @@ fn late_threads() {
         if let Err(e) = std::thread::Builder::new().name("victory-late-wait".into()).spawn(late_helper) {
             tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow");
         }
+        let late_level = late_stage();
         tracing::info!(
             most = late_most(),
             writes = late_writes(),
-            "submissions are sent to the card without a wait for each (VICTORY_LATE_WAIT=1)"
+            "submissions are sent to the card without a wait for each (VICTORY_LATE_WAIT={late_level})"
         );
         if relay() {
+            let relay_level = relay_stage();
             // Without it nothing would ever land.
             if let Err(e) = std::thread::Builder::new().name("victory-relay".into()).spawn(relay_worker) {
-                fail(format_args!("no thread to land submissions sent ahead (VICTORY_RELAY=1): {e}"));
+                fail(format_args!("no thread to land submissions sent ahead (VICTORY_RELAY={relay_level}): {e}"));
             }
             tracing::info!(
                 exact = relay_exact(),
-                "what shaders wrote is copied back by a thread of its own, beside the submitting thread (VICTORY_RELAY=1)"
+                "what shaders wrote is copied back by a thread of its own, beside the submitting thread (VICTORY_RELAY={relay_level})"
             );
         }
     });
@@ -2887,9 +2906,10 @@ fn late_line(frames: f64) {
         );
     }
     if relay() {
+        let relay_level = relay_stage();
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
-            "the relay per frame (VICTORY_RELAY=1): {:.1} flights landed in {:.1} landings by the thread that copies back, \
+            "the relay per frame (VICTORY_RELAY={relay_level}): {:.1} flights landed in {:.1} landings by the thread that copies back, \
              beside the submitting thread; that thread waited {:.1} ms for the card with nothing to land and {:.1} ms for \
              fetches of card copies' pieces, and was {:.1} ms landing in all (the frame line's \"copying back\" is its time; \
              \"settles\" above are waits of other threads for it)",
@@ -2901,9 +2921,10 @@ fn late_line(frames: f64) {
         );
     }
     if late_exact() {
+        let late_level = late_stage();
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
-            "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
+            "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT={late_level}): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
         );
@@ -7043,9 +7064,9 @@ impl Host {
             ]);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
+            let capture_frame = crate::capture::wanted(frame);
+            #[cfg(not(feature = "diagnostics"))]
+            let capture_frame = false;
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
@@ -7057,6 +7078,11 @@ impl Host {
                 let format = swap_format(plane.GetDesc().Format)?;
                 Some((plane, D3D12_RESOURCE_STATES(was as i32), format))
             });
+            let after_draw = if capture_frame {
+                D3D12_RESOURCE_STATE_COPY_SOURCE
+            } else {
+                D3D12_RESOURCE_STATE_PRESENT
+            };
             if let Some((plane, was, plane_format)) = over {
                 let mut barriers = vec![
                     transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
@@ -7083,7 +7109,7 @@ impl Host {
                 let mut barriers = vec![transition(
                     &back,
                     D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    D3D12_RESOURCE_STATE_PRESENT,
+                    after_draw,
                 )];
                 if moved {
                     barriers.push(transition(plane, readable, was));
@@ -7095,9 +7121,20 @@ impl Host {
                     transition(
                         &back,
                         D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_PRESENT,
+                        after_draw,
                     ),
                 ]);
+            }
+            #[cfg(feature = "diagnostics")]
+            let capture = capture_frame
+                .then(|| crate::capture::read_back(&self.device, list, &back))
+                .flatten();
+            if capture_frame {
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
             }
             copy.close();
             match slot {
