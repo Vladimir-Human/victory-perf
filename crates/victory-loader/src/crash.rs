@@ -17,7 +17,7 @@ use windows_sys::Win32::Foundation::{
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, RtlLookupFunctionEntry,
     RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
 };
 use windows_sys::Win32::System::LibraryLoader::{
@@ -134,13 +134,13 @@ const FATAL: [i32; 6] = [
     EXCEPTION_BREAKPOINT,
 ];
 
-/// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
-/// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
-/// line at `rax`; `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so
-/// a spin loop around them works with mwaitx as a yield.
+/// Emulates console-only instructions (`clwb` loops plus everything in [`crate::console_insn`])
+/// for an exception record without modifying executable code in place (used by unit tests).
+#[cfg(test)]
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
-    // SAFETY: the system passes valid exception pointers; the faulting
-    // instruction's bytes are readable, as the CPU just fetched them.
+    use crate::console_insn::{CMP_FLAGS, cmp_flags, emulate_slice, gpr};
+    // SAFETY: the system/caller passes valid exception pointers; bytes within the current
+    // page at `Rip` are readable.
     unsafe {
         let record = &*(*info).ExceptionRecord;
         let context = &mut *(*info).ContextRecord;
@@ -148,75 +148,30 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
             return false;
         }
         let code = context.Rip as *const u8;
-        match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
-            [0x0f, 0x01, 0xfa] => {}
-            [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
-            _ => {
-                // Only bytes inside the faulting instruction's page are read: the next page may
-                // not be mapped.
-                let room = 0x1000 - (context.Rip as usize & 0xfff);
-                let mut bytes = [0u8; 32];
-                let n = room.min(bytes.len());
-                std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
-                if let Some(pass) = clwb_loop(&bytes[..n]) {
-                    // A whole write-back loop in one exception (see `clwb_loop`).
-                    let limit = *gpr(context, pass.limit);
-                    let base = gpr(context, pass.base);
-                    *base = if *base <= limit {
-                        base.wrapping_add(((limit - *base) / 64 + 1) * 64)
-                    } else {
-                        base.wrapping_add(64)
-                    };
-                    let flags = cmp_flags(*base, limit);
-                    context.EFlags = context.EFlags & !CMP_FLAGS | flags;
-                    context.Rip += pass.len as u64;
-                    return true;
-                }
-                if n >= 15
-                    && let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
-                {
-                    // A write-back hint: the PC's memory is coherent, so it has nothing to do.
-                    context.Rip += len as u64;
-                    return true;
-                }
-                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
-                    return false;
-                };
-                context.Rip += len as u64;
-                return true;
-            }
+        let room = 0x1000 - (context.Rip as usize & 0xfff);
+        let mut bytes = [0u8; 32];
+        let n = room.min(bytes.len());
+        std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
+        if let Some(pass) = clwb_loop(&bytes[..n]) {
+            // A whole write-back loop in one exception (see `clwb_loop`).
+            let limit = *gpr(context, pass.limit);
+            let base = gpr(context, pass.base);
+            *base = if *base <= limit {
+                base.wrapping_add(((limit - *base) / 64 + 1) * 64)
+            } else {
+                base.wrapping_add(64)
+            };
+            let flags = cmp_flags(*base, limit);
+            context.EFlags = context.EFlags & !CMP_FLAGS | flags;
+            context.Rip += pass.len as u64;
+            return true;
         }
-        context.Rip += 3;
+        let Some(len) = emulate_slice(context, &bytes[..n]) else {
+            return false;
+        };
+        let _ = len;
+        true
     }
-    true
-}
-
-/// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
-/// Ice Lake lack: its length, or `None` for any other instruction.
-fn clwb_len(code: [u8; 15]) -> Option<usize> {
-    let at = if code[1] & 0xf0 == 0x40 { 2 } else { 1 };
-    if code[0] != 0x66 || code[at] != 0x0f || code[at + 1] != 0xae {
-        return None;
-    }
-    let modrm = code[at + 2];
-    let (mode, rm) = (modrm >> 6, modrm & 7);
-    if mode == 3 || (modrm >> 3) & 7 != 6 {
-        return None;
-    }
-    let mut len = at + 3;
-    let mut base = rm;
-    if rm == 4 {
-        base = code[len] & 7;
-        len += 1;
-    }
-    len += match mode {
-        0 if rm == 5 || (rm == 4 && base == 5) => 4,
-        1 => 1,
-        2 => 4,
-        _ => 0,
-    };
-    Some(len)
 }
 
 /// A `clwb` write-back loop as the title's compilers build it, one cache line a
@@ -232,6 +187,7 @@ fn clwb_len(code: [u8; 15]) -> Option<usize> {
 /// An exception costs about a microsecond and the title writes back whole
 /// buffers this way while it loads, so the loop is done in one: `clwb` has
 /// nothing to do on the PC, `base` ends past `limit` as the last pass leaves it.
+#[cfg(test)]
 struct ClwbLoop {
     base: u8,
     limit: u8,
@@ -239,6 +195,7 @@ struct ClwbLoop {
     len: usize,
 }
 
+#[cfg(test)]
 fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
     // clwb [base]: 66 [40|41] 0f ae, ModRM mod 00, reg 6, no SIB or displacement.
     let (rex, at) = match code.get(1)? {
@@ -277,85 +234,6 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
     (limit != base).then_some(ClwbLoop { base, limit, len })
 }
 
-/// The general register numbered `n` as instructions encode it.
-fn gpr(context: &mut CONTEXT, n: u8) -> &mut u64 {
-    match n & 15 {
-        0 => &mut context.Rax,
-        1 => &mut context.Rcx,
-        2 => &mut context.Rdx,
-        3 => &mut context.Rbx,
-        4 => &mut context.Rsp,
-        5 => &mut context.Rbp,
-        6 => &mut context.Rsi,
-        7 => &mut context.Rdi,
-        8 => &mut context.R8,
-        9 => &mut context.R9,
-        10 => &mut context.R10,
-        11 => &mut context.R11,
-        12 => &mut context.R12,
-        13 => &mut context.R13,
-        14 => &mut context.R14,
-        _ => &mut context.R15,
-    }
-}
-
-/// The status flags `cmp a, b` leaves (CF, PF, AF, ZF, SF, OF) as `EFLAGS` bits.
-fn cmp_flags(a: u64, b: u64) -> u32 {
-    let r = a.wrapping_sub(b);
-    u32::from(a < b)
-        | u32::from((r as u8).count_ones().is_multiple_of(2)) << 2
-        | (((a ^ b ^ r) >> 4) as u32 & 1) << 4
-        | u32::from(r == 0) << 6
-        | ((r >> 63) as u32) << 7
-        | ((((a ^ b) & (a ^ r)) >> 63) as u32) << 11
-}
-const CMP_FLAGS: u32 = 0x8d5;
-
-/// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
-/// the saved XMM registers; returns the instruction's length.
-unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
-    // SAFETY: the caller's code bytes are readable up to the instruction's end.
-    let b = |i: usize| unsafe { code.add(i).read() };
-    let prefix = b(0);
-    let (rex, at) = if b(1) & 0xf0 == 0x40 {
-        (b(1), 2)
-    } else {
-        (0, 1)
-    };
-    if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
-        return None;
-    }
-    let modrm = b(at + 2);
-    if modrm >> 6 != 3 {
-        return None;
-    }
-    let dst = usize::from((modrm >> 3) & 7 | (rex & 4) << 1);
-    let src = usize::from(modrm & 7 | (rex & 1) << 3);
-    let immediate = b(at + 1) == 0x78;
-    let (fields, len) = if immediate {
-        ((b(at + 3), b(at + 4)), at + 5)
-    } else {
-        // extrq reads its fields from src's low half, insertq from its high.
-        let f = if prefix == 0x66 { xmm[src].Low } else { xmm[src].High as u64 };
-        ((f as u8, (f >> 8) as u8), at + 3)
-    };
-    let (n, at_bit) = (u32::from(fields.0 & 63), u32::from(fields.1 & 63));
-    let bits = if n == 0 { 64 } else { n };
-    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
-    if prefix == 0x66 {
-        // extrq: register form takes its fields from src, works on dst.
-        if immediate && (modrm >> 3) & 7 != 0 {
-            return None;
-        }
-        let target = if immediate { src } else { dst };
-        xmm[target].Low = (xmm[target].Low >> at_bit) & mask;
-    } else {
-        let value = (xmm[src].Low & mask) << at_bit;
-        xmm[dst].Low = xmm[dst].Low & !(mask << at_bit) | value;
-    }
-    Some(len)
-}
-
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // an instruction of the console's CPU this one lacks: emulated, the title goes on
     // SAFETY: the system passes valid exception pointers.
@@ -367,10 +245,6 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         }
     }
     // SAFETY: the system passes valid exception pointers.
-    if unsafe { emulate_amd_only(info) } {
-        return -1; // EXCEPTION_CONTINUE_EXECUTION
-    }
-    // SAFETY: as above.
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
@@ -661,8 +535,10 @@ fn memory_at(address: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::console_insn::cmp_flags;
+    use crate::console_insn::decode::{ConsoleOnly, decode};
     use windows_sys::Win32::System::Diagnostics::Debug::{
-        EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
+        EXCEPTION_RECORD, M128A, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
 
     #[test]
@@ -760,26 +636,25 @@ mod tests {
 
     #[test]
     fn clwb_lengths() {
-        let pad = |b: &[u8]| {
-            let mut c = [0u8; 15];
-            c[..b.len()].copy_from_slice(b);
-            c
+        let clwb_len = |c: &[u8]| match decode(c) {
+            Some((ConsoleOnly::Clwb, len)) => Some(len),
+            _ => None,
         };
-        assert_eq!(clwb_len(pad(&[0x66, 0x41, 0x0f, 0xae, 0x31])), Some(5)); // clwb [r9]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x30])), Some(4)); // clwb [rax]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x70, 0x40])), Some(5)); // clwb [rax+0x40]
+        assert_eq!(clwb_len(&[0x66, 0x41, 0x0f, 0xae, 0x31]), Some(5)); // clwb [r9]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x30]), Some(4)); // clwb [rax]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x70, 0x40]), Some(5)); // clwb [rax+0x40]
         assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0])),
+            clwb_len(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0]),
             Some(8)
         ); // [rax+disp32]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x34, 0x24])), Some(5)); // clwb [rsp]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x34, 0x24]), Some(5)); // clwb [rsp]
         assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0])),
+            clwb_len(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0]),
             Some(8)
         ); // [rip+disp32]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x38])), None); // clflushopt, /7
-        assert_eq!(clwb_len(pad(&[0x0f, 0xae, 0x30])), None); // xsaveopt, no 66
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xf0])), None); // register form
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x38]), None); // clflushopt, /7
+        assert_eq!(clwb_len(&[0x0f, 0xae, 0x30]), None); // xsaveopt, no 66
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xf0]), None); // register form
     }
 
     #[test]
