@@ -12,16 +12,22 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! The default budget is 12 s per title frame and kind, a window the
-//! recording threads wait in together ([`DEFAULT_WAIT_MS`]); it was half
-//! a second. A pass the title runs only once and whose pipeline takes
-//! longer is lost: while a world loads the title dispatches the passes
-//! that unpack its models once. With a budget set below the defaults, a
-//! frame may wait longer for a pipeline while a run's loading allowance
-//! lasts ([`frame_budget`]), and never for one the driver has held for
-//! long ([`held_too_long`]).
-//! Ported from the sibling fork `joshuu/victory-amd`'s 4436f8f1 (its
-//! loading waits only).
+//! The default budget is [`DEFAULT_WAIT_MS`] (500 ms) in a single shared
+//! window per title frame across both graphics and compute pipelines
+//! ([`Sharing::Window`]), replacing an earlier 12 s-per-kind default that
+//! could stall a single frame for up to 24 s (12 s graphics + 12 s compute).
+//! During initial world loading, while a run's loading allowance lasts
+//! ([`frame_budget`], `VICTORY_PIPELINE_GATE_S`), a frame may wait up to
+//! [`LOADING_FRAME`] (4 s graphics) or [`LOADING_FRAME_COMPUTE`] (10 s
+//! compute) inside that same shared frame window so one-shot unpack passes
+//! complete without dropping geometry. Once the title reaches steady-state
+//! rendering ([`STEADY_QUIET_FRAMES`] consecutive wait-free frames) or spends
+//! its loading allowance, streaming frames use responsive caps
+//! ([`STREAMING_BASE_GFX`] / [`STREAMING_BASE_COMPUTE`]) that halve on
+//! consecutive waiting frames and under background queue pressure down to
+//! [`STREAMING_FLOOR_GFX`] / [`STREAMING_FLOOR_COMPUTE`], and never wait for
+//! a pipeline the driver has held too long ([`held_too_long`]). Setting
+//! `VICTORY_PIPELINE_WAIT_MS` explicitly honors that exact per-frame budget.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -173,38 +179,89 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-fn wait_budget() -> Duration {
+/// Configured base wait budget and whether `VICTORY_PIPELINE_WAIT_MS` was set
+/// explicitly by the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WaitConfig {
+    base: Duration,
+    explicit: bool,
+}
+
+/// Waiting allowed per title frame, over all threads and pipeline kinds.
+fn wait_config() -> WaitConfig {
     #[cfg(test)]
     if let Some(budget) = TEST_BUDGET.get() {
-        return budget;
+        return WaitConfig {
+            base: budget,
+            explicit: true,
+        };
     }
-    static BUDGET: OnceLock<Duration> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
+    static CONFIG: OnceLock<WaitConfig> = OnceLock::new();
+    *CONFIG.get_or_init(|| {
+        let parsed = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_WAIT_MS);
-        tracing::info!(millis, "host pipeline wait budget per frame, per kind");
-        Duration::from_millis(millis)
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        let config = match parsed {
+            Some(millis) => WaitConfig {
+                base: Duration::from_millis(millis),
+                explicit: true,
+            },
+            None => WaitConfig {
+                base: Duration::from_millis(DEFAULT_WAIT_MS),
+                explicit: false,
+            },
+        };
+        tracing::info!(
+            millis = config.base.as_millis() as u64,
+            explicit = config.explicit,
+            "host pipeline wait budget per frame (shared across graphics and compute)"
+        );
+        config
     })
 }
 
-/// The default of [`wait_budget`]: the picture before frame rate. A frame
-/// waits for pipelines still being made rather than drop their draws and
-/// dispatches, up to 12 s for each kind (graphics, compute), the threads
-/// together ([`Sharing::Window`]). At worst a frame then waits 24 s, both
-/// kinds' windows used up one after the other, under the title's GPU
-/// watchdog, which ends a run whose frame takes more than 30 s (decision
-/// 0007). Only a pipeline still not made after its frame's window loses
-/// that frame's draws. `VICTORY_PIPELINE_WAIT_MS=500` waits as before.
-const DEFAULT_WAIT_MS: u64 = 12_000;
+/// Waiting allowed per title frame, over all threads.
+fn wait_budget() -> Duration {
+    wait_config().base
+}
+
+/// Default base wait budget per frame when `VICTORY_PIPELINE_WAIT_MS` is not
+/// set: 500 ms. Keeping the default below [`held_too_long`]'s thresholds
+/// (3 s graphics, 10 s compute) ensures pathological driver compiles never
+/// freeze subsequent frames, while initial world loading still draws from
+/// [`loading_allowance`] and steady-state streaming decays adaptively via
+/// [`effective_budget`]. Explicit `VICTORY_PIPELINE_WAIT_MS` overrides are
+/// honored directly.
+const DEFAULT_WAIT_MS: u64 = 500;
 
 /// The title's GPU watchdog: one frame of more than this ends the run.
 const TITLE_WATCHDOG: Duration = Duration::from_secs(30);
 
-// Both kinds' windows, one after the other, stay under the watchdog.
-const _: () = assert!(2 * DEFAULT_WAIT_MS < TITLE_WATCHDOG.as_millis() as u64);
+/// What a frame may wait for one kind of pipeline while a world loads: they
+/// are asked for by the hundred then, and a pass the title runs once is
+/// lost if its pipeline is not there. Compute pipelines get more inside the
+/// shared frame window because one-shot passes that unpack world geometry are
+/// dispatched once.
+const LOADING_FRAME: Duration = Duration::from_secs(4);
+const LOADING_FRAME_COMPUTE: Duration = Duration::from_secs(10);
+
+/// Adaptive streaming wait caps once the title reaches steady-state rendering
+/// (or exhausts the loading allowance) under default settings.
+const STREAMING_BASE_GFX: Duration = Duration::from_millis(120);
+const STREAMING_BASE_COMPUTE: Duration = Duration::from_millis(500);
+const STREAMING_FLOOR_GFX: Duration = Duration::from_millis(16);
+const STREAMING_FLOOR_COMPUTE: Duration = Duration::from_millis(64);
+/// Consecutive wait-free frames that signal initial world loading has ended
+/// and live rendering has begun.
+const STEADY_QUIET_FRAMES: u64 = 30;
+/// Background worker queue depth above which streaming waits step down an
+/// extra notch so frames stay responsive while workers drain the backlog.
+const QUEUE_PRESSURE_THRESHOLD: u64 = 16;
+
+// Single shared frame window bounds any frame strictly under the GPU watchdog.
+const _: () = assert!(LOADING_FRAME_COMPUTE.as_millis() < TITLE_WATCHDOG.as_millis());
+const _: () = assert!(LOADING_FRAME.as_millis() <= LOADING_FRAME_COMPUTE.as_millis());
+const _: () = assert!(DEFAULT_WAIT_MS <= LOADING_FRAME.as_millis() as u64);
 
 #[cfg(test)]
 thread_local! {
@@ -212,18 +269,9 @@ thread_local! {
     static TEST_BUDGET: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
-/// What a frame may wait for one kind of pipeline while a world loads: they
-/// are asked for by the hundred then, and a pass the title runs once is
-/// lost if its pipeline is not there. Compute pipelines get more, apart:
-/// the passes that unpack a world's models are dispatched once (the
-/// sibling fork counted 130 compute pipelines dropped while a world loaded,
-/// and walls, floors, ceilings and faces missing for the session).
-const LOADING_FRAME: Duration = Duration::from_secs(4);
-const LOADING_FRAME_COMPUTE: Duration = Duration::from_secs(12);
-
 /// `VICTORY_PIPELINE_GATE_S` (120): the most a run waits past
-/// [`wait_budget`] for each kind, in seconds, all frames together; 0 waits
-/// as before. The title's GPU watchdog bounds one frame (30 s).
+/// [`wait_budget`] for each kind during initial loading, in seconds, all
+/// frames together; 0 disables the loading extension.
 fn loading_allowance() -> Duration {
     static TOTAL: OnceLock<Duration> = OnceLock::new();
     *TOTAL.get_or_init(|| {
@@ -236,12 +284,120 @@ fn loading_allowance() -> Duration {
     })
 }
 
-/// A frame's budget for a pipeline of one kind: the frame budget, or while
-/// the run's allowance for that kind lasts (`spent` of it gone) up to
-/// [`LOADING_FRAME`] or [`LOADING_FRAME_COMPUTE`].
+/// A frame's budget for a pipeline of one kind during loading or under an
+/// explicit `VICTORY_PIPELINE_WAIT_MS`: the base budget, or while the run's
+/// allowance for that kind lasts (`spent` of it gone) up to [`LOADING_FRAME`]
+/// or [`LOADING_FRAME_COMPUTE`].
 fn frame_budget(base: Duration, compute: bool, allowance: Duration, spent: Duration) -> Duration {
     let loading = if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME };
     base.max(loading.min(allowance.saturating_sub(spent)))
+}
+
+/// Snapshot of frame-to-frame streaming state observed at the start of a wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PacingSnapshot {
+    /// True once initial world loading has given way to steady-state frames.
+    steady_state: bool,
+    /// Number of consecutive frames immediately preceding this one that also
+    /// waited on pipelines.
+    streak: u32,
+}
+
+/// Tracks frame-to-frame waiting streaks and the transition from initial world
+/// loading into steady-state streaming.
+#[derive(Debug)]
+struct StreamingPacer {
+    last_wait_frame: Option<u64>,
+    consecutive_wait_frames: u32,
+    steady_state: bool,
+}
+
+impl StreamingPacer {
+    const fn new() -> Self {
+        Self {
+            last_wait_frame: None,
+            consecutive_wait_frames: 0,
+            steady_state: false,
+        }
+    }
+
+    fn observe_frame(&mut self, frame: u64, had_loading_wait: bool) -> PacingSnapshot {
+        match self.last_wait_frame {
+            None => {
+                if had_loading_wait && frame >= STEADY_QUIET_FRAMES {
+                    self.steady_state = true;
+                }
+                self.consecutive_wait_frames = 0;
+                self.last_wait_frame = Some(frame);
+            }
+            Some(prev) if frame == prev => {}
+            Some(prev) if frame > prev => {
+                let quiet_gap = frame - prev - 1;
+                if had_loading_wait && quiet_gap >= STEADY_QUIET_FRAMES {
+                    self.steady_state = true;
+                }
+                if quiet_gap == 0 {
+                    self.consecutive_wait_frames = self.consecutive_wait_frames.saturating_add(1);
+                } else {
+                    self.consecutive_wait_frames = 0;
+                }
+                self.last_wait_frame = Some(frame);
+            }
+            Some(_) => {}
+        }
+        PacingSnapshot {
+            steady_state: self.steady_state,
+            streak: self.consecutive_wait_frames,
+        }
+    }
+}
+
+/// Computes the effective per-frame wait budget for one pipeline request.
+///
+/// - When `VICTORY_PIPELINE_WAIT_MS` is explicitly configured
+///   (`config.explicit`), `config.base` is honored directly via
+///   [`frame_budget`] without adaptive decay.
+/// - Under default settings (`!config.explicit`), initial loading frames
+///   (`!snapshot.steady_state`) may draw from the loading allowance up to
+///   [`LOADING_FRAME`] / [`LOADING_FRAME_COMPUTE`]. Once steady-state
+///   rendering begins (or the loading allowance is exhausted), budgets start
+///   at [`STREAMING_BASE_GFX`] / [`STREAMING_BASE_COMPUTE`] and halve per
+///   consecutive waiting frame (and once more under heavy background queue
+///   pressure) down to [`STREAMING_FLOOR_GFX`] / [`STREAMING_FLOOR_COMPUTE`].
+fn effective_budget(
+    config: WaitConfig,
+    compute: bool,
+    allowance: Duration,
+    spent: Duration,
+    queue_depth: u64,
+    snapshot: PacingSnapshot,
+) -> Duration {
+    if config.base.is_zero() {
+        return Duration::ZERO;
+    }
+    if config.explicit {
+        return frame_budget(config.base, compute, allowance, spent);
+    }
+    if !snapshot.steady_state && !allowance.saturating_sub(spent).is_zero() {
+        return frame_budget(config.base, compute, allowance, spent);
+    }
+    let start = if compute {
+        STREAMING_BASE_COMPUTE.min(config.base)
+    } else {
+        STREAMING_BASE_GFX.min(config.base)
+    };
+    let floor = if compute {
+        STREAMING_FLOOR_COMPUTE
+    } else {
+        STREAMING_FLOOR_GFX
+    }
+    .min(start);
+    let shift = snapshot
+        .streak
+        .saturating_add(u32::from(queue_depth >= QUEUE_PRESSURE_THRESHOLD))
+        .min(8);
+    let decayed_ms = (start.as_millis() as u64) >> shift;
+    Duration::from_millis(decayed_ms).max(floor)
 }
 
 /// Whether the driver has held a pipeline for longer than most take, so no
@@ -406,25 +562,43 @@ impl FrameWait {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waits for `p` while frame `frame` has budget left inside the shared
+/// per-frame window across both graphics and compute pipelines.
 fn wait(p: &Pending, frame: u64) {
-    let base = wait_budget();
-    if base.is_zero() || p.slow() {
+    let config = wait_config();
+    if config.base.is_zero() || p.slow() {
         return;
     }
-    // What was waited past the base budget since the start, in
-    // milliseconds, by kind (others, compute).
+    // What was waited past the base budget during initial loading, in
+    // milliseconds, by kind (graphics, compute).
     static PAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let compute = p.computes();
     let past = &PAST[usize::from(compute)];
-    let budget = frame_budget(base, compute, loading_allowance(), Duration::from_millis(past.load(Ordering::Relaxed)));
-    // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now), by kind.
-    static FRAMES: [Mutex<FrameWait>; 2] = [const { Mutex::new(FrameWait::new()) }; 2];
-    let frame_wait = &FRAMES[usize::from(compute)];
+    let spent = Duration::from_millis(past.load(Ordering::Relaxed));
+    let had_loading_wait =
+        PAST[0].load(Ordering::Relaxed) > 0 || PAST[1].load(Ordering::Relaxed) > 0;
+    // Single shared frame wait window and streaming pacer across all threads
+    // and both pipeline kinds, preventing graphics + compute budgets from
+    // stacking back-to-back within one frame.
+    static FRAME_WAIT: Mutex<(FrameWait, StreamingPacer)> =
+        Mutex::new((FrameWait::new(), StreamingPacer::new()));
     let sharing = shared_budget();
     let started = Instant::now();
-    let left = frame_wait.lock().unwrap_or_else(|e| e.into_inner()).begin(sharing, frame, budget, started);
+    let (snapshot, left) = {
+        let mut guard = FRAME_WAIT.lock().unwrap_or_else(|e| e.into_inner());
+        let (frame_wait, pacer) = &mut *guard;
+        let snapshot = pacer.observe_frame(frame, had_loading_wait);
+        let budget = effective_budget(
+            config,
+            compute,
+            loading_allowance(),
+            spent,
+            WAITING.load(Ordering::Relaxed),
+            snapshot,
+        );
+        let left = frame_wait.begin(sharing, frame, budget, started);
+        (snapshot, left)
+    };
     if left.is_zero() {
         return;
     }
@@ -441,8 +615,17 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
-    past.fetch_add(waited.saturating_sub(base).as_millis() as u64, Ordering::Relaxed);
-    frame_wait.lock().unwrap_or_else(|e| e.into_inner()).end(sharing, frame, left, waited, Instant::now());
+    if !snapshot.steady_state || config.explicit {
+        past.fetch_add(
+            waited.saturating_sub(config.base).as_millis() as u64,
+            Ordering::Relaxed,
+        );
+    }
+    FRAME_WAIT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+        .end(sharing, frame, left, waited, Instant::now());
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -584,7 +767,12 @@ fn drained() {
 
 #[cfg(test)]
 mod loading_tests {
-    use super::{FrameWait, LOADING_FRAME, LOADING_FRAME_COMPUTE, Sharing, frame_budget, held_too_long, sharing_from};
+    use super::{
+        DEFAULT_WAIT_MS, FrameWait, LOADING_FRAME, LOADING_FRAME_COMPUTE, PacingSnapshot,
+        QUEUE_PRESSURE_THRESHOLD, STEADY_QUIET_FRAMES, STREAMING_BASE_COMPUTE, STREAMING_BASE_GFX,
+        STREAMING_FLOOR_COMPUTE, STREAMING_FLOOR_GFX, Sharing, StreamingPacer, WaitConfig,
+        effective_budget, frame_budget, held_too_long, sharing_from,
+    };
     use std::time::{Duration, Instant};
 
     /// Two threads ask for pipelines still being made in one frame, the
@@ -665,6 +853,169 @@ mod loading_tests {
         let between = Duration::from_secs(5);
         assert!(held_too_long(Duration::from_secs(60), true, between));
         assert!(!held_too_long(Duration::from_secs(60), false, between));
+        // Default budget (500 ms) enables held_too_long for both kinds.
+        let default_base = Duration::from_millis(DEFAULT_WAIT_MS);
+        assert!(held_too_long(Duration::from_secs(4), false, default_base));
+        assert!(held_too_long(Duration::from_secs(11), true, default_base));
+    }
+
+    /// Graphics and compute share one `FrameWait` window per frame so a single
+    /// frame never stacks two full windows back-to-back.
+    #[test]
+    fn shared_frame_window_caps_graphics_and_compute_together() {
+        let sharing = sharing_from(None);
+        let t0 = Instant::now();
+        let mut w = FrameWait::new();
+
+        // Graphics uses 3 s of its 4 s loading cap inside frame 10.
+        let g = w.begin(sharing, 10, LOADING_FRAME, t0);
+        assert_eq!(g, LOADING_FRAME);
+        w.end(sharing, 10, g, Duration::from_secs(3), t0 + Duration::from_secs(3));
+
+        // Compute arrives later in the same frame: it gets the remainder of
+        // LOADING_FRAME_COMPUTE (10 s - 3 s = 7 s), never another full 10 s.
+        let c = w.begin(sharing, 10, LOADING_FRAME_COMPUTE, t0 + Duration::from_secs(3));
+        assert_eq!(c, LOADING_FRAME_COMPUTE - Duration::from_secs(3));
+        w.end(sharing, 10, c, Duration::from_secs(2), t0 + Duration::from_secs(5));
+
+        // Total spent in frame 10 is 5 s, which already exceeds graphics' 4 s
+        // budget: a subsequent graphics wait gets zero rather than stalling.
+        let g2 = w.begin(sharing, 10, LOADING_FRAME, t0 + Duration::from_secs(5));
+        assert_eq!(g2, Duration::ZERO);
+
+        // Next frame starts with a fresh shared window.
+        assert_eq!(w.begin(sharing, 11, LOADING_FRAME, t0 + Duration::from_secs(6)), LOADING_FRAME);
+    }
+
+    /// Streaming pacer preserves initial loading protection across quiet menu
+    /// frames before a real world load, transitions into steady-state once
+    /// enough quiet frames pass after loading, decays on consecutive waiting
+    /// frames and queue buildup, and resets the streak after a quiet frame.
+    #[test]
+    fn streaming_pacer_transitions_decays_and_resets() {
+        let default_cfg = WaitConfig {
+            base: Duration::from_millis(DEFAULT_WAIT_MS),
+            explicit: false,
+        };
+        let allowance = Duration::from_secs(120);
+        let mut pacer = StreamingPacer::new();
+
+        // Splash / menu idle for 100 quiet frames before any heavy load must
+        // not prematurely enter steady state and drop one-shot load passes.
+        let s_menu = pacer.observe_frame(1, false);
+        assert!(!s_menu.steady_state);
+        let s_load = pacer.observe_frame(100, false);
+        assert!(!s_load.steady_state);
+        assert_eq!(s_load.streak, 0);
+        assert_eq!(
+            effective_budget(default_cfg, false, allowance, Duration::ZERO, 4, s_load),
+            LOADING_FRAME
+        );
+        assert_eq!(
+            effective_budget(default_cfg, true, allowance, Duration::ZERO, 4, s_load),
+            LOADING_FRAME_COMPUTE
+        );
+
+        // Multiple waits within the same frame do not increment streak.
+        assert_eq!(pacer.observe_frame(100, true), s_load);
+
+        // After loading spent allowance and STEADY_QUIET_FRAMES wait-free
+        // frames elapse, we enter steady state.
+        let steady_frame = 100 + STEADY_QUIET_FRAMES + 1;
+        let s_steady = pacer.observe_frame(steady_frame, true);
+        assert!(s_steady.steady_state);
+        assert_eq!(s_steady.streak, 0);
+        assert_eq!(
+            effective_budget(default_cfg, false, allowance, Duration::from_secs(5), 1, s_steady),
+            STREAMING_BASE_GFX
+        );
+        assert_eq!(
+            effective_budget(default_cfg, true, allowance, Duration::from_secs(5), 1, s_steady),
+            STREAMING_BASE_COMPUTE
+        );
+
+        // Consecutive waiting frames halve the streaming budget down to floor.
+        let s_next = pacer.observe_frame(steady_frame + 1, true);
+        assert_eq!(s_next.streak, 1);
+        assert_eq!(
+            effective_budget(default_cfg, false, allowance, Duration::from_secs(5), 1, s_next),
+            Duration::from_millis(60)
+        );
+        assert_eq!(
+            effective_budget(default_cfg, true, allowance, Duration::from_secs(5), 1, s_next),
+            Duration::from_millis(250)
+        );
+
+        // Heavy background queue buildup steps the budget down an extra notch.
+        assert_eq!(
+            effective_budget(
+                default_cfg,
+                false,
+                allowance,
+                Duration::from_secs(5),
+                QUEUE_PRESSURE_THRESHOLD,
+                s_next
+            ),
+            Duration::from_millis(30)
+        );
+
+        // Deep streak hits the responsive floor rather than dropping to zero.
+        let deep = PacingSnapshot {
+            steady_state: true,
+            streak: 10,
+        };
+        assert_eq!(
+            effective_budget(default_cfg, false, allowance, Duration::from_secs(5), 100, deep),
+            STREAMING_FLOOR_GFX
+        );
+        assert_eq!(
+            effective_budget(default_cfg, true, allowance, Duration::from_secs(5), 100, deep),
+            STREAMING_FLOOR_COMPUTE
+        );
+
+        // One wait-free frame resets the consecutive streak while staying steady.
+        let s_reset = pacer.observe_frame(steady_frame + 3, true);
+        assert!(s_reset.steady_state);
+        assert_eq!(s_reset.streak, 0);
+        assert_eq!(
+            effective_budget(default_cfg, false, allowance, Duration::from_secs(5), 0, s_reset),
+            STREAMING_BASE_GFX
+        );
+    }
+
+    /// Explicit `VICTORY_PIPELINE_WAIT_MS` overrides are honored verbatim
+    /// without steady-state decay, including 0 ms and high explicit budgets.
+    #[test]
+    fn explicit_wait_override_is_honored_in_steady_state() {
+        let allowance = Duration::from_secs(120);
+        let deep_steady = PacingSnapshot {
+            steady_state: true,
+            streak: 8,
+        };
+        let zero = WaitConfig {
+            base: Duration::ZERO,
+            explicit: true,
+        };
+        assert_eq!(
+            effective_budget(zero, true, allowance, Duration::ZERO, 50, deep_steady),
+            Duration::ZERO
+        );
+        let explicit_high = WaitConfig {
+            base: Duration::from_secs(12),
+            explicit: true,
+        };
+        assert_eq!(
+            effective_budget(explicit_high, false, allowance, Duration::ZERO, 50, deep_steady),
+            Duration::from_secs(12)
+        );
+        let explicit_small = WaitConfig {
+            base: Duration::from_millis(500),
+            explicit: true,
+        };
+        assert_eq!(
+            effective_budget(explicit_small, false, Duration::ZERO, Duration::ZERO, 50, deep_steady),
+            Duration::from_millis(500)
+        );
     }
 }
 
